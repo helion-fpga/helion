@@ -286,6 +286,22 @@ fn net_extra_between(a: Option<&str>, b: &str) -> u32 {
 pub const BRAM_CKO_PS: u32 = 2454;
 pub const BRAM_SETUP_PS: u32 = 737;
 
+// Hold (min-delay) arcs, fast corner, from the same X-Ray SDF files: the
+// minimum of the first triple (`FF_INIT` CLK->Q, `LUT6` A*->O6, `CARRY4`
+// S0->O0, `FF_INIT` HOLD DIN) and the block RAM's largest ADDR hold.
+pub const FF_CKQ_MIN_PS: u32 = 99;
+pub const LUT_MIN_PS: u32 = 45;
+pub const CARRY_MIN_PS: u32 = 60;
+pub const FF_HOLD_PS: u32 = 181;
+pub const BRAM_HOLD_PS: u32 = 360;
+
+/// A slow-corner delay at the fast corner. shortcut: route, block RAM, DSP
+/// and LUT RAM delays have no fast-corner table in Helion, so they are scaled
+/// by the LUT's fast/slow ratio (45/124); upgrade with per-arc fast values.
+pub fn fast_ps(slow_ps: u32) -> u32 {
+    slow_ps * LUT_MIN_PS / LUT_PS
+}
+
 // DSP48E1, slow corner from X-Ray's `timings/DSP_L.sdf` (zynq7). Unlike the
 // block RAM the DSP's delay depends heavily on which pipeline registers are
 // used, so these are two functions of the register configuration rather than
@@ -454,6 +470,53 @@ pub struct Analysis {
     pub worst_path: Vec<PathStep>,
     /// Worst slack (ps) of each clock domain, by clock net.
     pub clocks: Vec<(String, i64)>,
+    /// Setup slack of every timed endpoint, all domains.
+    pub endpoint_slacks: Vec<EndpointSlack>,
+    /// Hold analysis of the same endpoints.
+    pub hold: Hold,
+}
+
+/// Hold (min-delay) result: shortest arrival through fast-corner arcs
+/// against the endpoint's hold time, launch and capture clocks arriving
+/// together (the ideal clock tree the setup check also assumes; setup folds
+/// skew into [`MARGIN_PS`], hold takes it as zero).
+#[derive(Clone, Debug, Default)]
+pub struct Hold {
+    /// Worst hold slack (ps); 0 with no endpoint.
+    pub whs_ps: i64,
+    /// Sum of negative hold slacks (ps), 0 when every endpoint meets.
+    pub ths_ps: i64,
+    pub endpoints: usize,
+    pub failing_endpoints: usize,
+    /// Shortest path to the worst endpoint, launch first.
+    pub worst_path: Vec<PathStep>,
+    /// Clock domain of that endpoint.
+    pub clock: String,
+}
+
+impl Hold {
+    fn merge(&mut self, o: Hold) {
+        if o.endpoints > 0 && (self.endpoints == 0 || o.whs_ps < self.whs_ps) {
+            self.whs_ps = o.whs_ps;
+            self.worst_path = o.worst_path;
+            self.clock = o.clock;
+        }
+        self.ths_ps += o.ths_ps;
+        self.endpoints += o.endpoints;
+        self.failing_endpoints += o.failing_endpoints;
+    }
+}
+
+/// Setup slack at one timed endpoint.
+#[derive(Clone, Debug)]
+pub struct EndpointSlack {
+    /// Clock domain (flop clock net).
+    pub clock: String,
+    /// `cell pin` for a flop input, `site.pin` for a hard block or LUT RAM.
+    pub endpoint: String,
+    /// Site the endpoint sits on.
+    pub site: String,
+    pub slack_ps: i64,
 }
 
 impl Analysis {
@@ -506,9 +569,13 @@ pub fn analyze_clocks_async(
     let mut worst: Option<Analysis> = None;
     let (mut endpoints, mut failing) = (0usize, 0usize);
     let mut clocks = Vec::new();
+    let mut endpoint_slacks = Vec::new();
+    let mut hold = Hold::default();
     for dom in &domains {
         let period = period_of(dom).ok_or_else(|| format!("timing: no period known for clock `{dom}`"))?;
         let a = analyze_domain(routed, dom, period)?;
+        endpoint_slacks.extend(a.endpoint_slacks.iter().cloned());
+        hold.merge(a.hold.clone());
         endpoints += a.endpoints;
         failing += a.failing_endpoints;
         clocks.push((dom.to_string(), a.wns_ps));
@@ -516,7 +583,7 @@ pub fn analyze_clocks_async(
             worst = Some(a);
         }
     }
-    let mut w = worst.unwrap_or(Analysis { period_ps: 0, wns_ps: 0, failing_endpoints: 0, endpoints: 0, worst_path: Vec::new(), clocks: Vec::new() });
+    let mut w = worst.unwrap_or(Analysis { period_ps: 0, wns_ps: 0, failing_endpoints: 0, endpoints: 0, worst_path: Vec::new(), clocks: Vec::new(), endpoint_slacks: Vec::new(), hold: Hold::default() });
     if domains.is_empty() {
         w.period_ps = period_of("").unwrap_or(0);
         w.wns_ps = w.period_ps as i64;
@@ -524,6 +591,8 @@ pub fn analyze_clocks_async(
     w.endpoints = endpoints;
     w.failing_endpoints = failing;
     w.clocks = clocks;
+    w.endpoint_slacks = endpoint_slacks;
+    w.hold = hold;
     Ok(w)
 }
 
@@ -956,6 +1025,10 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     let mut worst_path = Vec::new();
     let mut failing = 0usize;
     let mut endpoints = 0usize;
+    let mut slacks: Vec<EndpointSlack> = Vec::new();
+    let mut record = |endpoint: String, site: &str, slack: i64| {
+        slacks.push(EndpointSlack { clock: domain.to_string(), endpoint, site: site.to_string(), slack_ps: slack })
+    };
     for pff in &placed.ffs {
         let Some(ff) = packed.ffs.iter().find(|f| f.name == pff.name) else { continue };
         if ff.clk_net != domain {
@@ -982,6 +1055,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let t = a + w;
             endpoints += 1;
             let slack = period_ps as i64 - setup as i64 - MARGIN_PS as i64 - t as i64;
+            record(format!("{} {pin}", ff.name), &pff.site, slack);
             if slack < 0 {
                 failing += 1;
             }
@@ -1004,6 +1078,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         let t = a + route(net, site, pin, false);
         endpoints += 1;
         let slack = period_ps as i64 - setup as i64 - MARGIN_PS as i64 - t as i64;
+        record(format!("{site}.{pin}"), site, slack);
         if slack < 0 {
             failing += 1;
         }
@@ -1021,6 +1096,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         let t = a + route(net, site, sp, false);
         endpoints += 1;
         let slack = period_ps as i64 - BRAM_SETUP_PS as i64 - MARGIN_PS as i64 - t as i64;
+        record(format!("{site}.{sp}"), site, slack);
         if slack < 0 {
             failing += 1;
         }
@@ -1038,6 +1114,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         let t = a + route(net, site, pin, false);
         endpoints += 1;
         let slack = period_ps as i64 - *setup as i64 - MARGIN_PS as i64 - t as i64;
+        record(format!("{site}.{pin}"), site, slack);
         if slack < 0 {
             failing += 1;
         }
@@ -1047,10 +1124,148 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             worst_path = p;
         }
     }
+    // Hold: the same endpoints, shortest arrival against the hold time.
+    let ctx = HoldCtx { lut_by_out: &lut_by_out, ff_by_q: &ff_by_q, carry_by_net: &carry_by_net, site_of: &site_of, lut_letter: &lut_letter, route: &route, bram_out: &bram_out, dsp_out: &dsp_out, lr: &lr, dsp_comb: &dsp_comb };
+    let mut hold_ends: Vec<(&str, &str, String, bool, u32, String)> = Vec::new(); // (net, site, pin, internal, hold, endpoint)
+    for pff in &placed.ffs {
+        let Some(ff) = packed.ffs.iter().find(|f| f.name == pff.name && f.clk_net == domain) else { continue };
+        let internal_d = matches!(crate::place::ff_d_source(pff, placed), crate::place::FfDSource::LutO6 | crate::place::FfDSource::CarryXor);
+        let letter = pff.bel.chars().next().unwrap_or('A');
+        let d_pin = if internal_d { format!("{letter}FF_D") } else { format!("{letter}X") };
+        hold_ends.push((ff.d_net.as_str(), pff.site.as_str(), d_pin.clone(), internal_d, FF_HOLD_PS, format!("{} {d_pin}", ff.name)));
+        // CE and SR hold are below zero in the SDF; checked against 0.
+        for (n, pin) in [(ff.ce_net.as_deref(), "CE"), (ff.sr_net.as_deref().filter(|_| !ff.sr_async), "SR")] {
+            if let Some(n) = n {
+                hold_ends.push((n, pff.site.as_str(), pin.into(), false, 0, format!("{} {pin}", ff.name)));
+            }
+        }
+    }
+    for (net, site, pin, _, clk) in crate::lutram::write_ends(placed) {
+        if clk == domain {
+            hold_ends.push((net, site, pin.into(), false, 0, format!("{site}.{pin}")));
+        }
+    }
+    for (net, site, sp) in &bram_in {
+        hold_ends.push((*net, *site, sp.clone(), false, BRAM_HOLD_PS, format!("{site}.{sp}")));
+    }
+    for (net, site, pin, _, _) in &dsp_in {
+        hold_ends.push((*net, *site, pin.clone(), false, 0, format!("{site}.{pin}")));
+    }
+    let mut hold = Hold { clock: domain.to_string(), ..Hold::default() };
+    let mut hmemo: HashMap<String, Option<(u32, Vec<PathStep>)>> = HashMap::new();
+    for (net, site, pin, internal, hold_ps, what) in hold_ends {
+        let Some((a, mut p)) = min_arrival(net, &mut hmemo, &ctx) else { continue };
+        let w = fast_ps(route(net, site, &pin, internal));
+        let slack = (a + w) as i64 - hold_ps as i64;
+        hold.endpoints += 1;
+        if slack < 0 {
+            hold.failing_endpoints += 1;
+            hold.ths_ps += slack;
+        }
+        if hold.endpoints == 1 || slack < hold.whs_ps {
+            hold.whs_ps = slack;
+            p.push(PathStep { what: format!("{what} (hold {hold_ps} ps)"), arrival_ps: a + w, wire_ps: w, xy: None });
+            hold.worst_path = p;
+        }
+    }
     if endpoints == 0 {
         wns = period_ps as i64;
     }
-    Ok(Analysis { period_ps, wns_ps: wns, failing_endpoints: failing, endpoints, worst_path, clocks: vec![(domain.to_string(), wns)] })
+    Ok(Analysis { period_ps, wns_ps: wns, failing_endpoints: failing, endpoints, worst_path, clocks: vec![(domain.to_string(), wns)], endpoint_slacks: slacks, hold })
+}
+
+/// What the hold walk reads: the setup pass's netlist indexes.
+struct HoldCtx<'a> {
+    lut_by_out: &'a HashMap<&'a str, &'a crate::pack::PackedLut>,
+    ff_by_q: &'a HashMap<&'a str, &'a crate::pack::PackedFf>,
+    carry_by_net: &'a HashMap<&'a str, (&'a crate::pack::PackedCarry, Option<usize>)>,
+    site_of: &'a HashMap<&'a str, &'a str>,
+    lut_letter: &'a HashMap<&'a str, char>,
+    route: &'a dyn Fn(&str, &str, &str, bool) -> u32,
+    bram_out: &'a HashMap<&'a str, &'a str>,
+    dsp_out: &'a HashMap<&'a str, (String, u32)>,
+    lr: &'a HashMap<&'a str, crate::lutram::ReadArc<'a>>,
+    dsp_comb: &'a HashMap<&'a str, &'a DspArc<'a>>,
+}
+
+/// Shortest arrival at a net through fast-corner arcs, with its path; None
+/// when no clocked element launches into it (pads, constants). A loop was
+/// already refused by the setup pass, so a revisit simply ends the walk.
+fn min_arrival(net: &str, memo: &mut HashMap<String, Option<(u32, Vec<PathStep>)>>, c: &HoldCtx) -> Option<(u32, Vec<PathStep>)> {
+    if let Some(x) = memo.get(net) {
+        return x.clone();
+    }
+    memo.insert(net.to_string(), None);
+    let step = |what: String, t: u32, w: u32| PathStep { what, arrival_ps: t, wire_ps: w, xy: None };
+    // Keep the earliest of a cell's timed inputs: (arrival incl. wire, path, wire).
+    let pick = |best: &mut Option<(u32, Vec<PathStep>, u32)>, cand: Option<(u32, Vec<PathStep>)>, w: u32| {
+        if let Some((a, p)) = cand {
+            if best.as_ref().is_none_or(|b| a + w < b.0) {
+                *best = Some((a + w, p, w));
+            }
+        }
+    };
+    let r = if let Some((what, cko)) = c.dsp_out.get(net) {
+        Some((fast_ps(*cko), vec![step(what.clone(), fast_ps(*cko), 0)]))
+    } else if let Some(b) = c.bram_out.get(net) {
+        let t = fast_ps(BRAM_CKO_PS);
+        Some((t, vec![step(format!("{b} (block RAM DO)"), t, 0)]))
+    } else if let Some(d) = c.dsp_comb.get(net) {
+        let mut best = d.launch.map(|t| (fast_ps(t), vec![step(format!("{} (DSP48E1 output)", d.name), fast_ps(t), 0)], 0));
+        for &(inn, pin, ps) in &d.ins {
+            let cand = min_arrival(inn, memo, c).map(|(a, mut p)| {
+                p.push(step(format!("{} (DSP48E1 {pin} -> P)", d.name), a, 0));
+                (a + fast_ps(ps), p)
+            });
+            pick(&mut best, cand, fast_ps((c.route)(inn, d.site, pin, false)));
+        }
+        best.map(|(t, p, _)| (t, p))
+    } else if let Some(r) = c.lr.get(net) {
+        let t = fast_ps(r.cko_ps);
+        let mut best = Some((t, vec![step(format!("{} (LUT RAM, clock {}, {})", r.name, r.clk, r.site), t, 0)], 0));
+        for (inn, pin) in &r.ins {
+            let cand = min_arrival(inn, memo, c).map(|(a, p)| (a + fast_ps(r.read_ps), p));
+            pick(&mut best, cand, fast_ps((c.route)(inn, r.site, pin, false)));
+        }
+        best.map(|(t, p, _)| (t, p))
+    } else if let Some(f) = c.ff_by_q.get(net) {
+        let site = c.site_of.get(f.name.as_str()).copied().unwrap_or("?");
+        Some((FF_CKQ_MIN_PS, vec![step(format!("{} (flop Q, clock {}, {site})", f.name, f.clk_net), FF_CKQ_MIN_PS, 0)]))
+    } else if let Some(l) = c.lut_by_out.get(net) {
+        let site = c.site_of.get(l.name.as_str()).copied().unwrap_or("");
+        let letter = c.lut_letter.get(l.name.as_str()).copied().unwrap_or('A');
+        let mut best = None;
+        for (k, inn) in l.input_nets.iter().enumerate() {
+            let Some(inn) = inn else { continue };
+            let cand = min_arrival(inn, memo, c);
+            pick(&mut best, cand, fast_ps((c.route)(inn, site, &format!("{letter}{}", k + 1), false)));
+        }
+        best.map(|(t, mut p, w)| {
+            p.push(step(format!("{} (LUT, {site})", l.name), t + LUT_MIN_PS, w));
+            (t + LUT_MIN_PS, p)
+        })
+    } else if let Some((carry, j)) = c.carry_by_net.get(net) {
+        let site = c.site_of.get(carry.name.as_str()).copied().unwrap_or("");
+        let mut best = None;
+        for s in carry.s_nets.iter().take(j.map(|j| j + 1).unwrap_or(4)).flatten() {
+            let cand = min_arrival(s, memo, c);
+            pick(&mut best, cand, fast_ps((c.route)(s, site, "S", true)));
+        }
+        if carry.cyinit.is_none() && !carry.ci_net.is_empty() {
+            let cascade = c.carry_by_net.get(carry.ci_net.as_str()).map(|(_, j)| j.is_none()).unwrap_or(false);
+            let w = if cascade { 0 } else { fast_ps((c.route)(&carry.ci_net, site, "AX", false)) };
+            let cand = min_arrival(&carry.ci_net, memo, c);
+            pick(&mut best, cand, w);
+        }
+        best.map(|(t, mut p, w)| {
+            p.push(step(format!("{} (CARRY4, {site})", carry.name), t + CARRY_MIN_PS, w));
+            (t + CARRY_MIN_PS, p)
+        })
+    } else {
+        None
+    };
+    memo.insert(net.to_string(), r.clone());
+    r
 }
 
 #[cfg(test)]
@@ -1177,7 +1392,7 @@ mod tests {
                 ..Default::default()
             },
             nets: vec![],
-         load_delays: Default::default(), graph_clocks: false };
+         load_delays: Default::default(), graph_clocks: false, net_pins: Default::default() };
         let err = report_timing(&routed, &tm, 10_000).expect_err("cycle must fail");
         assert!(err.contains("cycle"), "{err}");
         let _ = &mut packed;
@@ -1219,6 +1434,47 @@ mod tests {
         let via_ff = FF_CKQ_PS + 500 + net_extra_ps(4) + LUT_PS + 500 + net_extra_ps(2);
         assert_eq!(a.wns_ps, 10_000 - (FF_SETUP_PS + MARGIN_PS + via_ff) as i64, "{:?}", a.worst_path);
         assert_eq!((FF_CKQ_PS, LUT_PS, LUT_XMUX_PS, MARGIN_PS, net_extra_ps(0), net_extra_ps(13), net_extra_ps(40)), (456, 124, 299, 235, 130, 1365, 1365));
+    }
+
+    /// Hold: the shortest path, at fast-corner arcs, against the hold time.
+    /// A flop feeding a flop directly is the classic hold risk; a LUT in
+    /// between adds its fast-corner delay. Guard for WHS/THS.
+    #[test]
+    fn hold_takes_the_shortest_path_at_the_fast_corner() {
+        let ff = |name: &str, d: &str, q: &str| crate::pack::PackedFf {
+            name: name.into(), d_net: d.into(), q_net: q.into(), clk_net: "clk".into(),
+            ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
+        };
+        let pff = |name: &str, site: &str| crate::place::PlacedFf { name: name.into(), tile: "CLBLL_L_X10Y10".into(), site: site.into(), bel: "AFF".into() };
+        let mut routed = Routed7::default();
+        routed.placed.packed.ffs = vec![ff("a", "pa", "qa"), ff("b", "qa", "qb"), ff("c", "x", "qc")];
+        routed.placed.packed.luts.push(crate::pack::PackedLut { name: "l".into(), init: 2, input_nets: [Some("qa".into()), Some("qb".into()), None, None, None, None], output_net: "x".into() });
+        routed.placed.ffs = vec![pff("a", "SLICE_X0Y0"), pff("b", "SLICE_X1Y0"), pff("c", "SLICE_X2Y0")];
+        routed.placed.luts.push(crate::place::PlacedLut { name: "l".into(), init: 2, tile: "CLBLL_L_X10Y10".into(), site: "SLICE_X3Y0".into(), bel: "A6LUT".into() });
+        routed.load_delays.insert(("qa".into(), "SLICE_X1Y0".into(), "AX".into()), 248);
+        routed.load_delays.insert(("qa".into(), "SLICE_X3Y0".into(), "A1".into()), 992);
+        routed.load_delays.insert(("qb".into(), "SLICE_X3Y0".into(), "A2".into()), 124);
+        routed.load_delays.insert(("x".into(), "SLICE_X2Y0".into(), "AX".into()), 124);
+        let a = analyze(&routed, 10_000).unwrap();
+        let h = &a.hold;
+        assert_eq!(h.endpoints, 2, "pa is a pad: a's D is not timed");
+        // A routed connection one site long at the fast corner: the router's
+        // delay plus the measured wire correction, both scaled 45/124.
+        let wire = |routed_ps: u32| fast_ps(routed_ps + net_extra_ps(1)) as i64;
+        // a -> b: 99 + (248 + 225)*45/124 = 270 against 181.
+        assert_eq!(h.whs_ps, FF_CKQ_MIN_PS as i64 + wire(248) - FF_HOLD_PS as i64, "{:?}", h.worst_path);
+        assert!(h.worst_path.first().unwrap().what.starts_with("a (flop Q"), "{:?}", h.worst_path);
+        assert_eq!((h.failing_endpoints, h.ths_ps), (0, 0));
+        // Through the LUT, the faster input (qb, 45 ps of wire) wins.
+        let mut slow = routed.clone();
+        slow.load_delays.insert(("qa".into(), "SLICE_X1Y0".into(), "AX".into()), 0);
+        let h = analyze(&slow, 10_000).unwrap().hold;
+        // With no pip delay only the correction is left: 99 + 81 = 180, 1 ps short.
+        assert_eq!(h.whs_ps, FF_CKQ_MIN_PS as i64 + wire(0) - FF_HOLD_PS as i64);
+        assert_eq!((h.failing_endpoints, h.ths_ps), (1, h.whs_ps));
+        // c's D: 99 + 45 + 45 + 45 = 234 - 181.
+        let c_path = 99 + 45 + LUT_MIN_PS as i64 + 45 - FF_HOLD_PS as i64;
+        assert!(c_path > 0);
     }
 
     /// A PS7 port clock no flop shares is still a domain: its input is

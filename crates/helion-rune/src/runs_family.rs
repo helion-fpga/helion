@@ -114,6 +114,43 @@ pub fn family_timing(
     Some(st)
 }
 
+/// The Timing view's state from an implementation run's view contract: the
+/// placed-graph analysis the contract carries, so the Timing pane, the
+/// status bar and the contract reports state one WNS.
+fn view_timing(v: &helion_targets::view::ImplView, part: &str, send: &dyn Fn(String, MsgSev)) -> Option<TimingState> {
+    let Some(t) = &v.timing else {
+        let why = v.missing.get("timing").map(String::as_str).unwrap_or("no timing in this run");
+        send(format!("report_timing: not computed for {part}: {why}"), MsgSev::Warn);
+        return None;
+    };
+    let model = v.provenance.get("timing").map(|p| p.method.clone()).unwrap_or_default();
+    send(format!("report_timing WNS_PS={} TNS_PS={} endpoints={} ({} placed logic graph)", t.wns_ps, t.tns_ps, t.total_endpoints, v.family.label()), MsgSev::Info);
+    let clocks = v
+        .clocks
+        .iter()
+        .flat_map(|c| &c.clocks)
+        .filter(|c| c.period_ps > 0)
+        .map(|c| crate::state::TimingClock { name: c.name.clone(), period_ps: c.period_ps as u64, source: c.name.clone(), generated: false, master: None })
+        .collect();
+    let paths = t
+        .worst_path
+        .iter()
+        .map(|p| crate::state::TimingPathRow { name: "Path 1 (worst)".into(), from: p.from.clone(), to: p.to.clone(), slack_ps: p.slack_ps, delay_ps: p.requirement_ps - p.slack_ps, ..Default::default() })
+        .collect();
+    Some(TimingState {
+        wns_ps: Some(t.wns_ps),
+        tns_ps: t.tns_ps,
+        failing_endpoints: t.failing_endpoints,
+        failing_setup: t.failing_endpoints,
+        endpoints: t.total_endpoints,
+        has_run: true,
+        clocks,
+        paths,
+        model: format!("{}: {model}", v.family.label()),
+        ..TimingState::default()
+    })
+}
+
 /// Synthesis-run reports for a family part: family utilization, family
 /// timing model, die geometry. No power model exists for these families.
 pub fn family_synth_reports(
@@ -171,14 +208,18 @@ pub fn run_family(
         );
     }
     send(format!("launch_runs impl_1 -part {part} ({})", family.label()), MsgSev::Info);
-    let out = helion_targets::implement(&design, part, &mut |line| send(line.to_string(), MsgSev::Info))?;
+    let periods: Vec<(String, u32)> = clks.iter().map(|c| (if c.source.is_empty() { c.name.clone() } else { c.source.clone() }, c.period_ps as u32)).collect();
+    let (out, view) = helion_targets::implement_view(&design, part, &periods, &mut |line| send(line.to_string(), MsgSev::Info))?;
     let util = family_util(&design, part).map_err(|e| send(format!("WARN: utilization skipped: {e}"), MsgSev::Warn)).ok();
     let drc = family_drc(&design, part).map_err(|e| send(format!("WARN: DRC skipped: {e}"), MsgSev::Warn)).ok();
     if let Some(d) = &drc {
         let errors = d.iter().filter(|x| x.severity == DrcSev::Error).count();
         send(format!("report_drc {} violation(s), {errors} error(s)", d.len()), if errors > 0 { MsgSev::Warn } else { MsgSev::Info });
     }
-    let timing = family_timing(&design, part, xdc, clks, send);
+    let timing = match &view {
+        Some(v) => view_timing(v, part, send),
+        None => family_timing(&design, part, xdc, clks, send),
+    };
     let family_die = match (helion_targets::reports::die(part), helion_targets::reports::placement(&design, part)) {
         (Ok(grid), Ok(placed)) => Some(FamilyDie { grid, placed }),
         (Ok(grid), Err(e)) => {
@@ -214,6 +255,7 @@ pub fn run_family(
         drc,
         timing,
         family_die,
+        view,
         // Program Device then names the pack-and-load commands instead of
         // "No bitstream yet" sending the user back to Generate.
         bit_file: Some(path),
@@ -319,7 +361,7 @@ pub fn run_xdc_synth(source: &Path, part: &str, send: &dyn Fn(String, MsgSev)) -
     }
     let design_arg = srcs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(",");
     let mut log = |l: &str| send(l.to_string(), MsgSev::Info);
-    let (design, _) = helion_targets::xdc_flow::synth(&design_arg, top.as_deref(), "auto", &mut log)?;
+    let (design, _, _) = helion_targets::xdc_flow::synth(&design_arg, top.as_deref(), "auto", &mut log)?;
     let be = helion_targets::xdc_flow_types::Xilinx7Backend::open(part)?;
     let packed = be.pack(&design)?;
     let stem = helion_ir::resolve(design.name).to_string();
@@ -368,6 +410,7 @@ pub fn run_xdc_flow(source: &Path, part: &str, out_dir: &Path, send: &dyn Fn(Str
     let mut log = |l: &str| send(l.to_string(), MsgSev::Info);
     let b = helion_targets::xdc_flow::run(&design_arg, &xdc.display().to_string(), &bit.display().to_string(), top.as_deref(), false, "auto", part, None, &mut log)?
         .ok_or("xdc_flow stopped before routing")?;
+    let view = helion_targets::view_xilinx7::from_built(&b);
     let dev = b.backend.device();
     let p = &b.routed.placed.packed;
     let util = x7_util(p, dev, &stem);
@@ -392,6 +435,7 @@ pub fn run_xdc_flow(source: &Path, part: &str, out_dir: &Path, send: &dyn Fn(Str
         family_die,
         design: Some(b.design),
         bit_file: Some(bit.clone()),
+        view: Some(view),
         ..RunArtifacts::default()
     })
 }
@@ -434,6 +478,54 @@ pub fn seed_family_fixture(s: &mut crate::state::AppState, part: &str) -> Result
     Ok(())
 }
 
+/// Scene fixture: the view contract of a real ZedBoard blinky implementation
+/// (`examples/zedboard_blinky.prj`), run once per process and shared, since
+/// the flow takes most of a minute.
+pub fn seed_xilinx7_view_fixture(s: &mut crate::state::AppState) -> Result<(), String> {
+    static VIEW: std::sync::OnceLock<Result<helion_targets::view::ImplView, String>> = std::sync::OnceLock::new();
+    let v = VIEW.get_or_init(|| {
+        if !helion_targets::zynq_db_present() {
+            return Err("no zynq7 X-Ray database".into());
+        }
+        let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/zedboard_blinky.prj");
+        let dir = std::env::temp_dir().join(format!("helion-rune-view-fixture-{}", std::process::id()));
+        let art = run_xdc_flow(&prj, "xc7z020", &dir, &|_, _| {});
+        let _ = std::fs::remove_dir_all(&dir);
+        art?.view.ok_or_else(|| "the run produced no view".to_string())
+    });
+    s.project.part = helion_targets::ZEDBOARD_PART.to_string();
+    s.runs.impl_view = Some(v.clone()?);
+    // A real run's timing state carries WNS to the status bar; the fixture takes it from the view.
+    s.timing.wns_ps = s.runs.impl_view.as_ref().and_then(|v| v.timing.as_ref()).map(|t| t.wns_ps);
+    s.flow.impl_run = crate::state::RunStatus::Complete;
+    Ok(())
+}
+
+/// A real HL10 implementation of `examples/board_counter.sv` at 100 MHz:
+/// its reset and enable pads reach the logic over interconnect wires.
+pub fn hl10_board_counter_run() -> Result<RunArtifacts, String> {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!("helion-rune-hl10-view-{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let prj = dir.join("board_counter.prj");
+    let sv = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/board_counter.sv");
+    let art = std::fs::write(&prj, format!("part HL10T-C32-1\nread_sv {}\ncreate_clock -period 10.000 [get_ports clk]\n", sv.display()))
+        .map_err(|e| format!("{}: {e}", prj.display()))
+        .and_then(|()| crate::runs::run_blocking(crate::runs::RunKind::Impl, &prj, "HL10T-C32-1", &|_, _| {}));
+    let _ = std::fs::remove_dir_all(&dir);
+    art
+}
+
+/// Scene fixture: that HL10 run applied to the session, as a finished
+/// implementation run leaves it.
+pub fn seed_hl10_view_fixture(s: &mut crate::state::AppState) -> Result<(), String> {
+    let art = hl10_board_counter_run()?;
+    s.project.part = "HL10T-C32-1".to_string();
+    s.flow.impl_run = crate::state::RunStatus::Complete;
+    crate::runs::apply_artifacts(s, art);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +559,289 @@ mod tests {
         assert!(die.grid.count(helion_targets::reports::TileClass::Logic) > 1000);
         assert_eq!(die.placed.iter().filter(|p| p.class == helion_targets::reports::TileClass::Io).count(), 9);
         assert!(art.design.is_some(), "netlist for the schematic");
+    }
+
+    /// Guard: the view fixture the scenes draw carries the run's WNS to the
+    /// status bar, as a finished run's timing state does.
+    #[test]
+    fn the_view_fixture_gives_the_status_bar_the_runs_wns() {
+        if !helion_targets::zynq_db_present() {
+            eprintln!("skipped: no zynq7 X-Ray database");
+            return;
+        }
+        let mut s = crate::init();
+        seed_xilinx7_view_fixture(&mut s).expect("fixture");
+        let wns = s.runs.impl_view.as_ref().and_then(|v| v.timing.as_ref()).map(|t| t.wns_ps);
+        assert!(wns.is_some(), "the run has timing");
+        assert_eq!(s.timing.wns_ps, wns);
+    }
+
+    /// Guard: a ZedBoard implementation run fills the view contract from the
+    /// run itself (die, placement, routing, usage, timing, IO, clocks).
+    #[test]
+    fn zedboard_run_fills_the_impl_view_from_the_run() {
+        if !helion_targets::zynq_db_present() {
+            eprintln!("skipped: no zynq7 X-Ray database");
+            return;
+        }
+        let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/zedboard_blinky.prj");
+        let dir = std::env::temp_dir().join(format!("helion-rune-view-{}", std::process::id()));
+        let art = run_xdc_flow(&prj, "xc7z020", &dir, &|_, _| {}).expect("xdc flow");
+        let _ = std::fs::remove_dir_all(&dir);
+        let v = art.view.expect("impl view");
+        assert_eq!(v.part, "xc7z020clg484-1");
+        assert!(v.tiles.len() > 10_000 && v.cols > 0 && v.rows > 0, "{} tiles", v.tiles.len());
+        let regions = v.clock_regions();
+        assert_eq!(regions.len(), 6, "xc7z020 has six clock regions in the database: {regions:?}");
+        assert!(v.provenance["tiles"].method.contains("tilegrid.json"), "regions read, not derived");
+        assert!(v.cells.iter().filter(|c| c.kind == "FF").count() >= 27, "27-bit counter placed");
+        assert!(v.cells.iter().all(|c| !c.site.is_empty()));
+        let routed: Vec<_> = v.nets.iter().filter(|n| !n.hops.is_empty()).collect();
+        assert!(!routed.is_empty(), "routed nets with hops");
+        assert!(routed.iter().any(|n| n.driver.is_some() && !n.loads.is_empty()), "router pins on nets");
+        assert!(v.usage.iter().any(|u| u.sites_used > 0), "per-tile site usage");
+        assert!(v.usage.iter().all(|u| u.sites_used <= u.sites_capacity), "sites counted once per site");
+        assert!(v.usage.iter().any(|u| u.overflow.is_some_and(|o| o.h_used + o.v_used > 0)), "per-tile wire usage");
+        let t = v.timing.as_ref().expect("timing");
+        assert!(t.total_endpoints >= 27 && t.endpoints.len() == t.total_endpoints, "every endpoint's slack");
+        assert!(t.endpoints.iter().all(|e| e.x.is_some()), "endpoints land on the die");
+        assert!(t.whs_ps.is_some() && t.ths_ps.is_some() && t.worst_hold_path.is_some(), "hold is computed for this run");
+        let io = v.io.as_ref().expect("io");
+        assert_eq!(io.pins.len(), 9, "clk + 8 LEDs");
+        assert!(io.pins.iter().all(|p| p.bank.is_some()), "bank from the package table");
+        let c = v.clocks.as_ref().expect("clocks");
+        assert_eq!(c.clocks.len(), 1);
+        assert!(c.clocks[0].loads >= 27 && !c.clocks[0].regions.is_empty() && c.clocks[0].buffer.is_some(), "{:?}", c.clocks[0]);
+        assert!(c.bufgs_used >= 1 && c.bufgs_available == 32);
+        assert!(!v.control_sets.is_empty() && !v.high_fanout.is_empty());
+        let p = v.power.as_ref().expect("power estimate");
+        assert!(p.dynamic_mw > 0.0 && p.static_mw > 0.0 && !p.tiles.is_empty() && p.method.contains("fit error"), "{p:?}");
+        assert!(v.resources.iter().any(|r| r.name == "Slice Registers" && r.used >= 27.0), "utilization rows");
+        assert_eq!(v.congestion.len(), 2, "H and V congestion levels");
+    }
+
+    /// One real run of the ZedBoard OLED demo, shared by the schematic and
+    /// board guards (`None` without the X-Ray database).
+    fn oled_view() -> Option<&'static helion_targets::view::ImplView> {
+        static RUN: std::sync::OnceLock<Option<helion_targets::view::ImplView>> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            if !helion_targets::zynq_db_present() {
+                eprintln!("skipped: no zynq7 X-Ray database");
+                return None;
+            }
+            let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/zedboard_oled_demo.prj");
+            let dir = std::env::temp_dir().join(format!("helion-rune-oled-{}", std::process::id()));
+            let art = run_xdc_flow(&prj, "xc7z020", &dir, &|_, _| {}).expect("xdc flow");
+            let _ = std::fs::remove_dir_all(&dir);
+            Some(art.view.expect("impl view"))
+        })
+        .as_ref()
+    }
+
+    /// Guard: the RTL schematic is the v2 front end's elaborated netlist of
+    /// this run: word registers and operators, the design's own ports.
+    #[test]
+    fn oled_run_fills_the_rtl_schematic() {
+        use helion_targets::view::NetlistStage;
+        let Some(v) = oled_view() else { return };
+        let n = v.netlist(NetlistStage::Rtl).expect("RTL netlist");
+        assert_eq!(n.top, "zedboard_oled_demo");
+        assert_eq!(n.ports.len(), 8, "clk, six OLED pins, led");
+        let kind = |c: &str| n.cells.iter().find(|x| x.name == c).map(|x| x.kind.as_str());
+        for r in ["wait_cnt", "rom_idx", "bx", "by", "frame"] {
+            assert_eq!(kind(r), Some("RTL_REG"), "{r} is one word register");
+        }
+        let k = n.kinds();
+        assert!(k.get("RTL_ADD").copied().unwrap_or(0) + k.get("RTL_SUB").copied().unwrap_or(0) >= 3, "counters add: {k:?}");
+        assert!(k.get("RTL_MUX").copied().unwrap_or(0) >= 1 && k.get("RTL_EQ").copied().unwrap_or(0) >= 1, "{k:?}");
+        assert!(!k.keys().any(|t| t.starts_with("LUT") || t.starts_with("FD")), "no mapped primitives at RTL: {k:?}");
+        let clk = n.nets.iter().find(|x| x.name == "clk").expect("clk net");
+        assert_eq!(clk.drivers, vec!["clk".to_string()], "the port drives clk");
+        assert!(clk.loads.iter().filter(|l| l.ends_with("/C")).count() >= 5, "registers clocked by clk");
+        assert!(n.ports.iter().all(|p| !p.nets.is_empty()), "every port is wired");
+    }
+
+    /// Guard: the synthesized schematic is the mapped netlist the packer read.
+    #[test]
+    fn oled_run_fills_the_synthesized_schematic() {
+        use helion_targets::view::NetlistStage;
+        let Some(v) = oled_view() else { return };
+        let n = v.netlist(NetlistStage::Synthesized).expect("synthesized netlist");
+        let k = n.kinds();
+        let luts: usize = k.iter().filter(|(t, _)| t.starts_with("LUT")).map(|(_, c)| c).sum();
+        let ffs: usize = k.iter().filter(|(t, _)| t.starts_with("FD")).map(|(_, c)| c).sum();
+        assert!(luts >= 50 && ffs >= 60, "{k:?}");
+        assert!(!k.keys().any(|t| t.starts_with("RTL_")), "no RTL operators after mapping: {k:?}");
+        assert_eq!(ffs, v.cells.iter().filter(|c| c.kind == "FF").count(), "every flop the placer placed");
+        let undriven = n.nets.iter().filter(|x| x.drivers.is_empty() && !x.loads.is_empty()).count();
+        assert_eq!(undriven, 0, "every used net has a driver: {:?}", n.nets.iter().filter(|x| x.drivers.is_empty()).take(5).collect::<Vec<_>>());
+        assert!(n.cells.iter().all(|c| c.site.is_none()), "no placement before implementation");
+    }
+
+    /// Guard: the implemented schematic is the synthesized one with the
+    /// placement's site and BEL on every LUT and flop.
+    #[test]
+    fn oled_run_fills_the_implemented_schematic() {
+        use helion_targets::view::NetlistStage;
+        let Some(v) = oled_view() else { return };
+        let syn = v.netlist(NetlistStage::Synthesized).expect("synthesized");
+        let n = v.netlist(NetlistStage::Implemented).expect("implemented netlist");
+        assert!(n.cells.len() >= syn.cells.len());
+        for c in n.cells.iter().filter(|c| c.kind.starts_with("FD")) {
+            let site = c.site.as_deref().unwrap_or_else(|| panic!("{} unplaced", c.name));
+            assert!(site.starts_with("SLICE_") && c.bel.is_some(), "{}: {site} {:?}", c.name, c.bel);
+            assert!(v.cells.iter().any(|p| p.cell == c.name && p.site == site), "{} site from the run", c.name);
+        }
+        assert!(n.cells.iter().filter(|c| c.kind.starts_with("LUT")).all(|c| c.site.is_some()), "every LUT placed");
+        assert!(v.provenance[NetlistStage::Implemented.section()].method.contains("placed under their own name"));
+    }
+
+    /// Guard: the board panel puts the OLED demo's ports on the right
+    /// ZedBoard parts and lists what it leaves free.
+    #[test]
+    fn oled_run_maps_its_ports_onto_the_zedboard() {
+        let Some(v) = oled_view() else { return };
+        let b = v.board.as_ref().expect("board panel");
+        assert_eq!(b.board, "Avnet/Digilent ZedBoard");
+        let at = |p: &str| b.part_of(p).map(|(g, i)| (g.kind.as_str(), i.label.as_str(), i.pin.as_str()));
+        assert_eq!(at("clk"), Some(("Clock", "GCLK", "Y9")));
+        assert_eq!(at("led"), Some(("LED", "LD0", "T22")));
+        for (port, label, pin) in [("oled_dc", "OLED-DC", "U10"), ("oled_res", "OLED-RES", "U9"), ("oled_sclk", "OLED-SCLK", "AB12"), ("oled_sdin", "OLED-SDIN", "AA12"), ("oled_vbat", "OLED-VBAT", "U11"), ("oled_vdd", "OLED-VDD", "U12")] {
+            assert_eq!(at(port), Some(("OLED", label, pin)), "{port}");
+        }
+        assert_eq!(b.used().count(), 8);
+        assert!(b.off_board.is_empty(), "{:?}", b.off_board);
+        let free = |k: &str| b.groups.iter().find(|g| g.kind == k).map(|g| g.items.iter().filter(|i| i.port.is_none()).count());
+        assert_eq!((free("LED"), free("Switch"), free("Button"), free("Pmod JA")), (Some(7), Some(8), Some(5), Some(8)));
+    }
+
+    /// Checks every family's filled contract shares: a die, placed cells on
+    /// it, routed nets with hops, per-tile site and wire usage, every
+    /// endpoint's slack on the die, clocks, IO, the DRC deck, the
+    /// schematic stages, and a named reason for whatever is absent.
+    fn assert_view_is_filled(v: &helion_targets::view::ImplView, ports: usize) {
+        use helion_targets::view::NetlistStage;
+        assert!(!v.tiles.is_empty() && v.cols > 0 && v.rows > 0);
+        let on_die: std::collections::HashSet<&str> = v.tiles.iter().map(|t| t.name.as_str()).collect();
+        let sites: std::collections::HashSet<&str> = v.tiles.iter().flat_map(|t| t.sites.iter().map(String::as_str)).collect();
+        assert!(v.cells.iter().filter(|c| c.kind == "FF").count() >= 4, "the counter's flops are placed");
+        for c in &v.cells {
+            assert!(c.tile.as_deref().is_some_and(|t| on_die.contains(t)), "{c:?} is off the die");
+            assert!(sites.contains(c.site.as_str()), "{c:?}: no such site in its tile");
+        }
+        let routed: Vec<_> = v.nets.iter().filter(|n| !n.hops.is_empty()).collect();
+        assert!(!routed.is_empty(), "routed nets with hops");
+        assert!(routed.iter().all(|n| n.hops.iter().all(|h| on_die.contains(h.tile.as_str()))), "every hop names a tile of the die");
+        assert!(v.nets.iter().any(|n| n.driver.is_some() && !n.loads.is_empty()), "driver and loads on nets");
+        assert!(v.usage.iter().any(|u| u.sites_used > 0) && v.usage.iter().all(|u| u.sites_used <= u.sites_capacity), "per-tile site usage within capacity");
+        assert!(v.usage.iter().any(|u| u.overflow.is_some_and(|o| o.h_used + o.v_used > 0)), "per-tile wire usage");
+        assert!(v.usage.iter().filter_map(|u| u.overflow).all(|o| o.h_used <= o.h_capacity && o.v_used <= o.v_capacity), "a routed design is within wire capacity");
+        assert_eq!(v.congestion.len(), 2, "H and V congestion levels");
+        let t = v.timing.as_ref().expect("timing");
+        assert!(t.total_endpoints >= 4 && t.endpoints.len() == t.total_endpoints, "every endpoint's slack: {} of {}", t.endpoints.len(), t.total_endpoints);
+        assert!(t.endpoints.iter().all(|e| e.x.is_some() && e.y.is_some()), "endpoints land on the die");
+        assert_eq!(t.endpoints.iter().map(|e| e.slack_ps).min(), Some(t.wns_ps), "WNS is the worst endpoint");
+        assert!(t.worst_path.is_some() && t.fmax_mhz.is_some());
+        let c = v.clocks.as_ref().expect("clocks");
+        assert_eq!(c.clocks.len(), 1, "{:?}", c.clocks);
+        assert!(c.clocks[0].loads >= 4 && c.clocks[0].period_ps == 10_000 && c.clocks[0].buffer.is_some(), "{:?}", c.clocks[0]);
+        assert!(c.bufgs_used >= 1 && c.bufgs_available >= c.bufgs_used);
+        let io = v.io.as_ref().expect("io");
+        assert_eq!(io.pins.len(), ports, "one pin per port bit: {:?}", io.pins);
+        assert!(io.pins.iter().all(|p| !p.package_pin.is_empty() && (p.bank.is_some() || p.package_pin == "configuration port")), "{:?}", io.pins);
+        assert!(io.package_pins >= io.pins.len());
+        assert!(!v.control_sets.is_empty() && !v.high_fanout.is_empty() && !v.resources.is_empty());
+        assert!(v.resources.iter().all(|r| r.used <= r.available as f64), "{:?}", v.resources);
+        assert!(v.drc_rules.len() >= 9 && v.provenance.contains_key("drc"), "the DRC deck ran");
+        let syn = v.netlist(NetlistStage::Synthesized).expect("synthesized netlist");
+        let imp = v.netlist(NetlistStage::Implemented).expect("implemented netlist");
+        assert!(syn.kinds().keys().any(|k| k.starts_with("LUT")) && imp.cells.iter().filter(|c| c.site.is_some()).count() >= 4);
+        assert!(v.netlist(NetlistStage::Rtl).is_none() && v.missing[NetlistStage::Rtl.section()].contains("word-level"), "the missing RTL stage names why");
+        for section in ["board"] {
+            assert!(v.missing.get(section).is_some_and(|m| m.len() > 20), "{section} names its reason");
+        }
+        // Every report and device panel renders a table or a named reason.
+        use crate::views::contract_views as cv;
+        let text = format!("{}{}", cv::render_all_reports(v), cv::render_device_tab(v));
+        assert!(!text.contains("not available") && !text.contains("placeholder"), "{text}");
+        for r in cv::Report::ALL {
+            let p = cv::report(v, r).render();
+            assert!(p.contains("---") || p.contains("missing input:"), "{r:?}: {p}");
+        }
+    }
+
+    fn counter_view(part: &str) -> helion_targets::view::ImplView {
+        let mut s = crate::init();
+        seed_family_fixture(&mut s, part).expect("family run");
+        s.runs.impl_view.expect("impl view")
+    }
+
+    /// Guard: an iCE40 implementation run fills the view contract from the
+    /// run itself, and names what iCE40 does not have.
+    #[test]
+    fn ice40_run_fills_the_impl_view_from_the_run() {
+        let v = counter_view("ice40-hx8k");
+        assert_eq!((v.family, v.cols, v.rows, v.row0_top), (helion_targets::Family::Ice40, 34, 34, false));
+        assert_view_is_filled(&v, 2);
+        let io = v.io.as_ref().unwrap();
+        let pin = |port: &str| io.pins.iter().find(|p| p.port == port).unwrap();
+        assert_eq!((pin("clk").package_pin.as_str(), pin("clk").bank, pin("clk").clock_capable), ("J3", Some(3), Some(true)));
+        assert_eq!((pin("led").package_pin.as_str(), pin("led").bank, pin("led").clock_capable), ("B5", Some(0), Some(false)));
+        assert!(v.clocks.as_ref().unwrap().clocks[0].buffer.as_deref().is_some_and(|b| b.starts_with("glb_netwk_")));
+        assert!(v.clock_regions().is_empty() && v.missing["clock-regions"].contains("no clock regions"));
+        assert!(v.missing["io-standard"].contains("VCCIO") && v.missing["power"].contains("no power model") && v.missing["hold"].contains("one corner"));
+        assert!(v.power.is_none() && v.timing.as_ref().unwrap().whs_ps.is_none());
+        assert!(v.provenance["timing"].method.contains("iCE40-HX8K delay model"));
+        let ran = |id: &str| v.drc_rules.iter().find(|r| r.id == id).unwrap().not_run.is_none();
+        assert!(ran("UCIO-1") && ran("LUTLP-1") && ran("RTSTAT-1") && ran("HLN-CLKPIN") && !ran("NSTD-1") && !ran("ZPS7-1"));
+        assert!(v.drc.is_empty(), "{:?}", v.drc);
+    }
+
+    /// Guard: an ECP5 implementation run fills the view contract from the
+    /// run itself: quadrants as clock regions, banks from the IO database.
+    #[test]
+    fn ecp5_run_fills_the_impl_view_from_the_run() {
+        let v = counter_view("LFE5U-85F");
+        assert_eq!((v.family, v.cols, v.rows, v.row0_top), (helion_targets::Family::Ecp5, 127, 96, true));
+        assert_view_is_filled(&v, 2);
+        assert_eq!(v.clock_regions(), vec!["LL", "LR", "UL", "UR"], "the four global clock quadrants");
+        let c = &v.clocks.as_ref().unwrap().clocks[0];
+        assert!(!c.regions.is_empty() && c.buffer.as_deref().is_some_and(|b| b.contains("DCC")), "{c:?}");
+        let io = v.io.as_ref().unwrap();
+        assert!(io.pins.iter().any(|p| p.port == "clk" && p.package_pin == "A10" && p.clock_capable == Some(true)), "{:?}", io.pins);
+        assert!(io.pins.iter().any(|p| p.port == "led" && p.package_pin == "A12"));
+        assert!(v.nets.iter().any(|n| n.kind == "clock-spine" && !n.hops.is_empty()), "the global clock's arcs");
+        assert!(v.tiles_of(helion_targets::view::TileClass::Dsp).count() > 0 && v.tiles_of(helion_targets::view::TileClass::Ram).count() > 0);
+        assert!(v.missing["io-standard"].contains("IO type") && v.missing["power"].contains("no power model"));
+        assert!(v.drc.is_empty(), "{:?}", v.drc);
+    }
+
+    /// Guard: an HL10 implementation run (the run worker's own flow) fills
+    /// the view contract from the routed design.
+    #[test]
+    fn hl10_run_fills_the_impl_view_from_the_run() {
+        let art = hl10_board_counter_run().expect("HL10 run");
+        let wns = art.timing.as_ref().and_then(|t| t.wns_ps).expect("the run's WNS");
+        let v = art.view.expect("impl view");
+        assert_eq!((v.family, v.part.as_str(), v.row0_top), (helion_targets::Family::Helion, "HL10T-C32-1", false));
+        assert_view_is_filled(&v, 11);
+        let t = v.timing.as_ref().unwrap();
+        assert_eq!(t.wns_ps, wns, "the contract states the run's WNS");
+        assert!(t.whs_ps.is_some(), "the HL10 model has a hold figure");
+        assert!(v.cells.iter().any(|c| c.kind == "LUT" && c.site.contains("/BLE") && c.bel.as_deref() == Some("LUT")));
+        assert!(v.nets.iter().any(|n| n.kind == "pips" && n.hops.iter().all(|h| h.wire.starts_with(['N', 'E', 'S', 'W']))), "nets on interconnect wires");
+        let io = v.io.as_ref().unwrap();
+        assert!(io.pins.iter().any(|p| p.port == "clk" && p.package_pin == "configuration port"), "the implicit user clock: {:?}", io.pins);
+        assert_eq!(io.pins.iter().filter(|p| p.package_pin.starts_with("IOB_X") && p.bank.is_some()).count(), 10, "rst, en and eight LEDs on pads");
+        let p = v.power.as_ref().expect("power from the HL10 model");
+        assert!(p.total_mw > 0.0 && (p.total_mw - p.static_mw - p.dynamic_mw).abs() < 1e-6 && p.tiles.is_empty());
+        assert!(v.missing["power-tiles"].contains("attributes nothing to a tile"));
+        assert!(v.missing["clock-regions"].contains("no clock regions") && v.missing["clock-capable"].contains("any HL10 input pad"));
+        // No IOSTANDARD and no pin in the project: reported as Vivado would.
+        assert!(v.drc.iter().any(|d| d.rule == "NSTD-1" && d.message.contains("LVCMOS18")), "{:?}", v.drc);
+        assert!(v.drc.iter().any(|d| d.rule == "UCIO-1" && d.message.contains("the flow chose IOB_X")), "{:?}", v.drc);
+        assert!(!v.drc.iter().any(|d| d.rule == "UCIO-1" && d.message.starts_with("clk:")), "the implicit clock needs no pin: {:?}", v.drc);
+        assert!(v.drc_rules.iter().find(|r| r.id == "HLN-CLKPIN").unwrap().not_run.is_some());
     }
 
     #[test]

@@ -1957,6 +1957,10 @@ dependencies = [
  "helion-ecp5",
  "helion-ice40",
  "helion-ir",
+ "helion-pack",
+ "helion-place",
+ "helion-route",
+ "helion-sta",
  "helion-sv",
  "helion-xilinx7",
 ]

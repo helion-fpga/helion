@@ -265,6 +265,9 @@ pub struct RunArtifacts {
     pub family_die: Option<crate::runs_family::FamilyDie>,
     /// 7-series `.bit` on disk: Program Device loads it with openFPGALoader.
     pub bit_file: Option<PathBuf>,
+    /// Implementation view contract (impl runs of every family): what the
+    /// Device layers, heat maps and contract reports draw.
+    pub view: Option<helion_targets::view::ImplView>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -313,6 +316,8 @@ pub struct RunsState {
     /// Die + placement of the last iCE40/ECP5 run (the Device view draws it
     /// for family parts instead of the HL10T canvas).
     pub family_die: Option<crate::runs_family::FamilyDie>,
+    /// View contract of the last implementation run that produced one.
+    pub impl_view: Option<helion_targets::view::ImplView>,
     /// Re-analysis context of the last successful run (`None` until one).
     pub analysis: Option<AnalysisCtx>,
     /// Finished runs, oldest first (Summary Run History card).
@@ -921,6 +926,15 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     if let Some(b) = art.bit_file {
         s.program.file = Some(b);
     }
+    // A run with its own netlist stages opens the schematic on them; a run
+    // without shows its session design.
+    // An HL10 run keeps opening on its session design (the live view its
+    // device canvas cross-probes); its stages are a click away.
+    s.schematic.stage = match (&art.view, &art.design) {
+        (Some(v), _) if !v.schematic.is_empty() && v.family != helion_targets::Family::Helion => Some(helion_targets::view::NetlistStage::Synthesized),
+        (_, Some(_)) => None,
+        _ => s.schematic.stage,
+    };
     if let Some(d) = art.design {
         s.runs.live_design = Some(d);
     }
@@ -929,6 +943,13 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     }
     if let Some(f) = art.family_die {
         s.runs.family_die = Some(f);
+    }
+    if let Some(v) = art.view {
+        s.runs.impl_view = Some(v);
+        if let Some(live) = s.schematic.stage.and(crate::live::schematic_netlist(s)) {
+            s.schematic.set_all(&live, false);
+            crate::views::schematic::refit(s);
+        }
     }
     if !art.part.is_empty() {
         if let Ok(dev) = helion_device::Device::load_part(&art.part) {
@@ -1399,6 +1420,12 @@ fn run_worker(
         MsgSev::Info,
     );
     art.power = Some(power_state_from(&pr, &xdc.operating_conditions));
+    art.view = Some(helion_targets::view_hl10::from_routed(
+        design,
+        routed,
+        &dev,
+        &helion_targets::view_hl10::Hl10Reports { timing: timing_opt.as_ref(), clocks: &clks, power: Some(&pr) },
+    ));
     let mut drc = helion_drc::check_routed(design, routed, &dev);
     if !pblocks.is_empty() {
         // Floorplan check: every pblock member inside its pblock (`PBLK-1`).
@@ -1500,6 +1527,23 @@ fn run_worker(
     });
     art.summary = summarize(&art);
     finish(Ok(art));
+}
+
+/// Run one flow on the calling thread and return its artifacts: headless
+/// runs and tests. The IDE runs the same worker on a thread.
+pub(crate) fn run_blocking(kind: RunKind, source: &std::path::Path, part: &str, send: &dyn Fn(String, MsgSev)) -> Result<RunArtifacts, String> {
+    let (tx, rx) = mpsc::channel();
+    let files = RunFiles { checkpoint: None, incremental: None, pblocks: Vec::new(), ooc: Vec::new(), ooc_cache: std::env::temp_dir() };
+    run_worker(kind, source.to_path_buf(), part.to_string(), Vec::new(), impl_strategy_for("default"), files, tx, Arc::new(AtomicBool::new(false)));
+    let mut out = Err("the run ended without a result".to_string());
+    for e in rx.try_iter() {
+        match e {
+            RunEvent::Line { text, sev } => send(text, sev),
+            RunEvent::Finished(r) => out = r,
+            RunEvent::Cancelled => {}
+        }
+    }
+    out
 }
 
 /// Synth-run reports: pre-place timing estimate (summary + clocks +
@@ -2893,6 +2937,7 @@ mod tests {
             ooc: Vec::new(),
             family_die: None,
             bit_file: None,
+            view: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);

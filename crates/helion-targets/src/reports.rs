@@ -38,7 +38,7 @@ impl FamilyUtilization {
 /// HX8K capacities (Lattice FPGA-DS-02029): 7680 logic cells (one LUT4 +
 /// one DFF each), 32 sysMEM EBR (4 Kb), 2 PLLs on CT256, 8 global buffers,
 /// 206 user I/O on CT256. HX parts have no MAC16 / SPRAM.
-const ICE40_HX8K: [(&str, usize); 6] = [
+pub(crate) const ICE40_HX8K: [(&str, usize); 6] = [
     ("LUT4", 7680),
     ("DFF", 7680),
     ("EBR (4 Kb)", 32),

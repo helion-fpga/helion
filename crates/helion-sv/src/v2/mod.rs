@@ -16,6 +16,7 @@ pub mod lutram;
 pub mod mem;
 pub mod parse;
 pub mod pre;
+pub mod rtl;
 pub mod srl;
 
 use helion_ir::Design;
@@ -48,6 +49,8 @@ pub struct Synth {
     pub warnings: Vec<String>,
     /// Every flop with the source register bit it holds.
     pub regmap: Vec<lower::RegMap>,
+    /// The elaborated word-level netlist (see [`rtl`]).
+    pub rtl: Design,
 }
 
 fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, String)], dirs: Vec<std::path::PathBuf>) -> Result<Synth, String> {
@@ -89,6 +92,7 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
     if hard() {
         dsp::infer(&mut flat);
     }
+    let rtl = rtl::rtl_design(&flat);
     let (mut design, mut st, undriven) = lower::lower(&flat)?;
     if hard() && srl::on() {
         srl::infer(&mut design, &mut st);
@@ -125,7 +129,7 @@ fn run(sources: &[(String, String)], top: Option<&str>, defines: &[(String, Stri
             attrs: helion_ir::Attrs::default(),
         });
     }
-    Ok(Synth { design, luts: st.luts, ffs: st.ffs, depth: st.depth, warnings, regmap: st.regmap })
+    Ok(Synth { design, luts: st.luts, ffs: st.ffs, depth: st.depth, warnings, regmap: st.regmap, rtl })
 }
 
 /// Synthesize SystemVerilog sources (name, text). `top` names the top

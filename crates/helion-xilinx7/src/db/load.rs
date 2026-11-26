@@ -59,6 +59,10 @@ pub struct TileGridEntry {
     pub pin_functions: HashMap<String, String>,
     #[serde(default)]
     pub prohibited_sites: Vec<String>,
+    /// Clock region (`X0Y1`) the tile belongs to, when the database records
+    /// one; routing-only and edge tiles have none.
+    #[serde(default)]
+    pub clock_region: Option<String>,
 }
 
 /// Load `tilegrid.json`: tile name -> [`TileGridEntry`].

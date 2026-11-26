@@ -88,6 +88,22 @@ impl LiveKind {
         }
     }
 
+    /// Class of a type name from the view contract's netlist (Xilinx
+    /// primitive or RTL operator); operators draw in the logic column.
+    pub fn from_prim(k: &str) -> Self {
+        match k {
+            _ if k.starts_with("LUT") || (k.starts_with("RTL_") && !matches!(k, "RTL_REG" | "RTL_LATCH" | "RTL_CONST")) => LiveKind::Lut,
+            _ if k.starts_with("FD") || k == "RTL_REG" || k == "RTL_LATCH" || k == "FF" => LiveKind::Ff,
+            "IBUF" => LiveKind::IobIn,
+            "OBUF" => LiveKind::IobOut,
+            _ if k.starts_with("BUFG") => LiveKind::ClkBuf,
+            _ if k.starts_with("DSP") => LiveKind::Dsp,
+            _ if k.starts_with("RAMB") => LiveKind::Bram,
+            _ if k.starts_with("CARRY") => LiveKind::Carry,
+            _ => LiveKind::BlackBox,
+        }
+    }
+
     pub fn from_cell(kind: &helion_ir::CellKind) -> Self {
         match kind {
             helion_ir::CellKind::Lut6 { .. } => LiveKind::Lut,
@@ -111,6 +127,10 @@ pub struct LiveCell {
     pub name: String,
     pub kind: LiveKind,
     pub fanout: usize,
+    /// The cell's own type name (`FDRE`, `LUT4`, `RTL_ADD`).
+    pub prim: String,
+    /// Site and BEL, in an implemented netlist.
+    pub loc: Option<String>,
 }
 
 /// One real net: engine name, endpoint count, and the sorted cell names on it.
@@ -174,10 +194,13 @@ impl LiveNetlist {
             .iter()
             .map(|c| {
                 let name = helion_ir::resolve(c.name).to_string();
+                let kind = LiveKind::from_cell(&c.kind);
                 LiveCell {
                     fanout: touch.get(&name).copied().unwrap_or(0),
                     name,
-                    kind: LiveKind::from_cell(&c.kind),
+                    kind,
+                    prim: kind.label().to_string(),
+                    loc: None,
                 }
             })
             .collect();
@@ -228,6 +251,78 @@ impl LiveNetlist {
             ports_out,
             hier,
         }
+    }
+
+    /// Live view of one stage of the view contract's schematic netlist. An
+    /// output port fed by a net of another name gets a net of its own name
+    /// carrying that net's drivers, so the port draws its wire.
+    pub fn from_netlist(n: &helion_targets::view::SchematicNetlist) -> Self {
+        let cell_of = |e: &str| e.rsplit_once('/').map(|(c, _)| c.to_string());
+        let mut touch: HashMap<String, usize> = HashMap::new();
+        let mut nets: Vec<LiveNet> = n
+            .nets
+            .iter()
+            .map(|net| {
+                let ends = net.drivers.len() + net.loads.len();
+                // Driver cells first: the sheet layout draws from the first cell.
+                let mut cells: Vec<String> = net.drivers.iter().filter_map(|e| cell_of(e)).collect();
+                let mut loads: Vec<String> = net.loads.iter().filter_map(|e| cell_of(e)).filter(|c| !cells.contains(c)).collect();
+                loads.sort();
+                loads.dedup();
+                cells.dedup();
+                cells.extend(loads);
+                for c in &cells {
+                    *touch.entry(c.clone()).or_insert(0) += ends.saturating_sub(1);
+                }
+                LiveNet { name: net.name.clone(), loads: ends, cells }
+            })
+            .collect();
+        let by_name: HashMap<&str, &helion_targets::view::NetlistNet> = n.nets.iter().map(|x| (x.name.as_str(), x)).collect();
+        for p in n.ports.iter().filter(|p| p.direction != "input") {
+            if by_name.contains_key(p.name.as_str()) {
+                continue;
+            }
+            let mut cells: Vec<String> = p.nets.iter().filter_map(|x| by_name.get(x.as_str())).flat_map(|x| x.drivers.iter().filter_map(|e| cell_of(e))).collect();
+            cells.sort();
+            cells.dedup();
+            nets.push(LiveNet { name: p.name.clone(), loads: cells.len() + 1, cells });
+        }
+        nets.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut cells: Vec<LiveCell> = n
+            .cells
+            .iter()
+            .map(|c| LiveCell {
+                fanout: touch.get(&c.name).copied().unwrap_or(0),
+                name: c.name.clone(),
+                kind: LiveKind::from_prim(&c.kind),
+                prim: c.kind.clone(),
+                loc: c.site.as_ref().map(|s| match &c.bel {
+                    Some(b) => format!("{s}/{b}"),
+                    None => s.clone(),
+                }),
+            })
+            .collect();
+        cells.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut ports_in: Vec<String> = n.ports.iter().filter(|p| p.direction == "input").map(|p| p.name.clone()).collect();
+        let mut ports_out: Vec<String> = n.ports.iter().filter(|p| p.direction != "input").map(|p| p.name.clone()).collect();
+        ports_in.sort();
+        ports_out.sort();
+        let mut inst_names: Vec<&str> = n.instances.iter().map(|(i, _)| i.as_str()).collect();
+        inst_names.sort_unstable();
+        let mut owned: HashMap<&str, usize> = HashMap::new();
+        for c in &cells {
+            if let Some(o) = owner_prefix(&c.name, |p| inst_names.binary_search(&p).is_ok()) {
+                *owned.entry(o).or_insert(0) += 1;
+            }
+        }
+        let mut hier: Vec<LiveHier> = n
+            .instances
+            .iter()
+            .map(|(name, module)| LiveHier { cells: owned.get(name.as_str()).copied().unwrap_or(0), name: name.clone(), module: module.clone(), conns: 0 })
+            .collect();
+        hier.sort_by(|a, b| a.name.cmp(&b.name));
+        hier.dedup_by(|a, b| a.name == b.name);
+        LiveNetlist { design: n.top.clone(), cells, nets, ports_in, ports_out, hier }
     }
 
     pub fn cell(&self, name: &str) -> Option<&LiveCell> {
@@ -492,6 +587,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static PLACED: std::cell::RefCell<Option<Cached<LivePlaced>>> =
         const { std::cell::RefCell::new(None) };
+    static STAGE_NETLIST: std::cell::RefCell<Option<Cached<LiveNetlist>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Re-check the cached view models' fingerprints on their next use. `view()`
@@ -528,6 +625,17 @@ fn cached<T>(
 pub fn live_netlist(s: &AppState) -> Option<std::rc::Rc<LiveNetlist>> {
     let d = live_design(s)?;
     Some(cached(&NETLIST, built_from(d, None), || fingerprint(d, None), || LiveNetlist::from_design(d)))
+}
+
+/// The netlist the Schematic view draws: the chosen stage of the last
+/// implementation run's view contract, else the session design.
+pub fn schematic_netlist(s: &AppState) -> Option<std::rc::Rc<LiveNetlist>> {
+    let Some(n) = s.schematic.stage.and_then(|st| s.runs.impl_view.as_ref()?.netlist(st)) else {
+        return live_netlist(s);
+    };
+    let key = BuiltFrom { design: std::ptr::from_ref(n) as usize, cells: n.cells.len(), nets: n.nets.len(), placed: n.stage as usize + 1 };
+    // The contract is replaced, never edited in place, so its address and sizes identify it.
+    Some(cached(&STAGE_NETLIST, key, || 0, || LiveNetlist::from_netlist(n)))
 }
 
 /// Sorted live placement of the last implementation run, if any.

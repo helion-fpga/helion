@@ -24,7 +24,7 @@ impl Ice40Backend {
     }
 
     /// The shared routing graph, built once.
-    fn router(&self) -> &'static Router {
+    pub fn router(&self) -> &'static Router {
         static ROUTER: OnceLock<Router> = OnceLock::new();
         ROUTER.get_or_init(Router::build)
     }

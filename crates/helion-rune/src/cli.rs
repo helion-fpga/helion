@@ -15,6 +15,8 @@ pub fn usage() -> String {
   {BIN}                          open the IDE (Start page, recent projects)
   {BIN} <project.prj|file.sv>    open the IDE on a project or source
   {BIN} --headless <file>        synthesize, place, route and report timing; prints WNS_PS
+  {BIN} --headless <top.sv> --part <7-series part>
+                                 same on a lone source; constraints from <top>.xdc next to it
   {BIN} --source <script.tcl>    run a Tcl script in batch mode (exit 1 on the first error)
   {BIN} --stdin                  Tcl console on stdin, one command per line (`quit` ends)
   {BIN} --version                version line
@@ -45,7 +47,10 @@ pub fn run(args: &[String]) -> Option<i32> {
             0
         }
         Some("--headless") => match args.get(1) {
-            Some(path) => headless(Path::new(path)),
+            Some(path) => {
+                let part = args.iter().position(|a| a == "--part").and_then(|i| args.get(i + 1));
+                headless(Path::new(path), part.map(String::as_str))
+            }
             None => stdin_console(),
         },
         Some("--stdin") => stdin_console(),
@@ -85,12 +90,47 @@ fn open(s: &mut crate::AppState, path: &Path) -> Result<String, String> {
     }
 }
 
+/// Print a view contract the way every family's headless run does: all
+/// reports, the device layers and heat maps, the schematic and board
+/// summary, and the usage line.
+fn print_view(v: &helion_targets::view::ImplView) {
+    use crate::views::contract_views as cv;
+    print!("{}", cv::render_all_reports(v));
+    print!("{}", cv::render_device_tab(v));
+    print!("{}", cv::summary_lines(v));
+    println!("{}", cv::usage_summary(v));
+}
+
+/// The part a headless run targets: the `.prj`'s, else `--part`.
+fn headless_part(path: &Path, part: Option<&str>) -> Option<String> {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
+        return Some(helion_proj::load_prj(&std::fs::read_to_string(path).ok()?).ok()?.part);
+    }
+    part.map(str::to_string)
+}
+
 /// `--headless <file>`: the full flow plus timing, as one command.
-fn headless(path: &Path) -> i32 {
+fn headless(path: &Path, part: Option<&str>) -> i32 {
+    if let Some(code) = headless_xilinx7(path, part) {
+        return code;
+    }
+    let target = headless_part(path, part);
+    if let Some(p) = target.as_deref().filter(|p| crate::runs_family::foreign_family(p).is_some()) {
+        return headless_family(path, p);
+    }
     let mut s = state();
     if let Err(e) = open(&mut s, path) {
         eprintln!("{BIN}: {e}");
         return 1;
+    }
+    // The implemented design's view contract first, then the timing lines
+    // the release gate reads. A design that synthesizes but does not
+    // implement still reports its synthesis timing; the reason is on stderr.
+    let part = target.unwrap_or_else(|| s.project.part.clone());
+    match crate::runs::run_blocking(crate::runs::RunKind::Impl, path, &part, &|l, _| eprintln!("{l}")).map(|a| a.view) {
+        Ok(Some(v)) => print_view(&v),
+        Ok(None) => eprintln!("{BIN}: the implementation run produced no view"),
+        Err(e) => eprintln!("{BIN}: no implementation view: {e}"),
     }
     match crate::tcl::eval_batch(&mut s, "report_timing") {
         Ok(out) => {
@@ -111,6 +151,68 @@ fn headless(path: &Path) -> i32 {
             1
         }
     }
+}
+
+/// An iCE40 or ECP5 part: run its flow and print the same report set a
+/// 7-series run prints, then the routed design's WNS.
+fn headless_family(path: &Path, part: &str) -> i32 {
+    match crate::runs::run_blocking(crate::runs::RunKind::Impl, path, part, &|l, _| eprintln!("{l}")).map(|a| a.view) {
+        Ok(Some(v)) => {
+            print_view(&v);
+            match &v.timing {
+                Some(t) => {
+                    println!("WNS_PS={}", t.wns_ps);
+                    0
+                }
+                None => {
+                    eprintln!("{BIN}: no timing: {}", v.missing.get("timing").map(String::as_str).unwrap_or("the run timed no endpoint"));
+                    1
+                }
+            }
+        }
+        Ok(None) => {
+            eprintln!("{BIN}: the run produced no implementation view");
+            1
+        }
+        Err(e) => {
+            eprintln!("{BIN}: {e}");
+            1
+        }
+    }
+}
+
+/// A `.prj` on a 7-series part, or a lone HDL source with `--part` naming a
+/// 7-series part (its `<stem>.xdc` beside it), runs the XDC flow and prints
+/// the view contract's reports, device layers, heat maps and usage line.
+/// `None` for any other source (the Tcl path handles it).
+fn headless_xilinx7(path: &Path, part: Option<&str>) -> Option<i32> {
+    let part = headless_part(path, part)?;
+    if !crate::runs_family::is_xilinx7(&part) {
+        return None;
+    }
+    let out = std::env::temp_dir().join(format!("helion-ide-headless-{}", std::process::id()));
+    let art = crate::runs_family::run_xdc_flow(path, &part, &out, &|l, _| eprintln!("{l}"));
+    let _ = std::fs::remove_dir_all(&out);
+    Some(match art.map(|a| a.view) {
+        Ok(Some(v)) => {
+            print_view(&v);
+            match &v.timing {
+                Some(t) => {
+                    println!("WNS_PS={}", t.wns_ps);
+                    0
+                }
+                None => 1,
+            }
+        }
+        Ok(None) => {
+            eprintln!("{BIN}: the run produced no implementation view");
+            1
+        }
+        Err(e) => {
+            eprintln!("{BIN}: {e}");
+            1
+        }
+    })
 }
 
 /// `--source <script.tcl>`: Vivado-style batch mode.

@@ -96,10 +96,12 @@ pub enum ReportNav {
     ControlSets,
     Ssn,
     Ibis,
+    /// Every report of the implementation view contract (7-series runs).
+    ImplView,
 }
 
 impl ReportNav {
-    pub const ALL: [ReportNav; 9] = [
+    pub const ALL: [ReportNav; 10] = [
         ReportNav::Utilization,
         ReportNav::Power,
         ReportNav::Drc,
@@ -109,6 +111,7 @@ impl ReportNav {
         ReportNav::ControlSets,
         ReportNav::Ssn,
         ReportNav::Ibis,
+        ReportNav::ImplView,
     ];
 
     /// Pages computed by [`io`] engines on a background worker.
@@ -130,6 +133,7 @@ impl ReportNav {
             ReportNav::ControlSets => "Control Sets",
             ReportNav::Ssn => "SSN",
             ReportNav::Ibis => "IBIS Model",
+            ReportNav::ImplView => "Implemented Design",
         }
     }
 
@@ -144,6 +148,7 @@ impl ReportNav {
             ReportNav::ControlSets => "reports-nav-ctrlsets",
             ReportNav::Ssn => "reports-nav-ssn",
             ReportNav::Ibis => "reports-nav-ibis",
+            ReportNav::ImplView => "reports-nav-impl-view",
         }
     }
 
@@ -159,6 +164,7 @@ impl ReportNav {
             ReportNav::ControlSets => "Control Sets - control_sets_1",
             ReportNav::Ssn => "SSN - ssn_1",
             ReportNav::Ibis => "IBIS - write_ibis_1",
+            ReportNav::ImplView => "Implemented Design - impl_1",
         }
     }
 }
@@ -1720,6 +1726,7 @@ fn report_content(s: &AppState, t: &VivadoTheme) -> El {
             ReportNav::ControlSets => io::control_body(s, t),
             ReportNav::Ssn => io::ssn_body(s, t),
             ReportNav::Ibis => io::ibis_body(s, t),
+            ReportNav::ImplView => panels::impl_view_body(s, t),
         })
 }
 

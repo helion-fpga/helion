@@ -134,6 +134,8 @@ pub struct Tile {
     pub grid_y: i32,
     pub sites: Vec<SiteInst>,
     pub buses: Vec<BusData>,
+    /// Clock region from `tilegrid.json`, when the database records one.
+    pub clock_region: Option<String>,
     /// First global wire id belonging to this tile.
     wire_base: u32,
 }
@@ -375,6 +377,7 @@ impl Device {
                 grid_y: e.grid_y,
                 sites,
                 buses,
+                clock_region: e.clock_region.clone(),
                 wire_base,
             });
         }
@@ -780,7 +783,8 @@ impl Device {
         self.sites_of_types(&["DSP48E1"])
     }
 
-    fn sites_of_types(&self, types: &[&str]) -> Vec<(String, String)> {
+    /// Sites of the given site types: `(tile_name, site_name)`.
+    pub fn sites_of_types(&self, types: &[&str]) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for t in &self.tiles {
             for s in &t.sites {
@@ -1239,6 +1243,7 @@ impl Device {
                 grid_y: gy,
                 sites,
                 buses,
+                clock_region: None,
                 wire_base,
             });
             idx
