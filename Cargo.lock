@@ -1863,6 +1863,7 @@ dependencies = [
  "helion-sta",
  "helion-sv",
  "helion-targets",
+ "helion-update",
  "helion-verif",
  "helion-vhdl",
  "rune",

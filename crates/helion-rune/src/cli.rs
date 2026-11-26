@@ -19,6 +19,7 @@ pub fn usage() -> String {
                                  same on a lone source; constraints from <top>.xdc next to it
   {BIN} --source <script.tcl>    run a Tcl script in batch mode (exit 1 on the first error)
   {BIN} --stdin                  Tcl console on stdin, one command per line (`quit` ends)
+  {BIN} --fetch-xray-db          download the Project X-Ray database the 7-series parts need
   {BIN} --version                version line
   {BIN} --doctor                 target triple, bundled device data, self-check
   {BIN} --help                   this text
@@ -54,6 +55,7 @@ pub fn run(args: &[String]) -> Option<i32> {
             None => stdin_console(),
         },
         Some("--stdin") => stdin_console(),
+        Some("--fetch-xray-db") => fetch_xray(None),
         Some("--source") | Some("-source") => match args.get(1) {
             Some(path) => source(Path::new(path)),
             None => {
@@ -111,6 +113,10 @@ fn headless_part(path: &Path, part: Option<&str>) -> Option<String> {
 
 /// `--headless <file>`: the full flow plus timing, as one command.
 fn headless(path: &Path, part: Option<&str>) -> i32 {
+    // Before anything else: without its database a 7-series part is not even recognised as one.
+    if let Some(p) = headless_part(path, part) {
+        offer_xray(&p);
+    }
     if let Some(code) = headless_xilinx7(path, part) {
         return code;
     }
@@ -213,6 +219,75 @@ fn headless_xilinx7(path: &Path, part: Option<&str>) -> Option<i32> {
             1
         }
     })
+}
+
+/// `--fetch-xray-db`: download the database families not yet on disk (or
+/// only `only`), with progress on stderr. Asking for it is the consent.
+fn fetch_xray(only: Option<&'static helion_update::xray_db::Family>) -> i32 {
+    let Some(root) = helion_update::xray_db::install_root() else {
+        eprintln!("{BIN}: no home directory to put the Project X-Ray database in; set HELION_XILINX_DB to a directory");
+        return 1;
+    };
+    let families: Vec<_> = crate::xray::missing(&root).into_iter().filter(|f| only.is_none_or(|o| o.name == f.name)).collect();
+    if families.is_empty() {
+        println!("Project X-Ray database already in {}", root.display());
+        return 0;
+    }
+    eprintln!("{}", crate::xray::consent(&root, &families));
+    let job = std::sync::Arc::new(crate::xray::Job::default());
+    let worker = {
+        let (job, root, families) = (job.clone(), root.clone(), families.clone());
+        std::thread::spawn(move || crate::xray::fetch(&root, &families, &job))
+    };
+    let mut last = String::new();
+    while !worker.is_finished() {
+        let line = job.line();
+        if line != last {
+            eprint!("\r{line}   ");
+            last = line;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    eprintln!();
+    match worker.join() {
+        Ok(Ok(line)) => {
+            println!("{line}");
+            0
+        }
+        Ok(Err(e)) => {
+            eprintln!("{BIN}: {e}");
+            1
+        }
+        Err(_) => {
+            eprintln!("{BIN}: the download stopped unexpectedly; nothing half-installed is used");
+            1
+        }
+    }
+}
+
+/// Before a 7-series run whose database family is missing: ask at a
+/// terminal (default no); a script only gets the command to run.
+fn offer_xray(part: &str) {
+    use std::io::IsTerminal;
+    let Some(family) = helion_update::xray_db::family_for_part(part) else { return };
+    let Some(root) = helion_update::xray_db::install_root() else { return };
+    // A database the flow already finds elsewhere needs nothing.
+    if helion_targets::xilinx_db_root().join(family.name).is_dir() || !crate::xray::missing(&root).iter().any(|f| f.name == family.name) {
+        return;
+    }
+    let how = format!("run `{BIN} --fetch-xray-db` to download it, or set HELION_XILINX_DB to a prjxray-db checkout");
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{BIN}: {part} needs the Project X-Ray database ({}), which is not installed; {how}", family.name);
+        return;
+    }
+    eprint!("{part} needs the Project X-Ray database. {}? [y/N] ", crate::xray::consent(&root, &[*family]));
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    if matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+        fetch_xray(Some(family));
+    } else {
+        eprintln!("Not downloaded; {how}.");
+    }
 }
 
 /// `--source <script.tcl>`: Vivado-style batch mode.

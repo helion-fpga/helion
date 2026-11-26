@@ -1796,7 +1796,7 @@ pub(crate) fn part_not_implementable(part: &str) -> String {
     let parts = helion_targets::implementable_parts();
     let list = |fs: &[Family]| parts.iter().filter(|p| fs.contains(&p.family)).map(|p| p.part.as_str()).collect::<Vec<_>>().join(", ");
     let p = part.to_ascii_lowercase();
-    let db = "7-series parts appear when the Project X-Ray database has them: set HELION_XILINX_DB (see docs/xilinx-db.md)";
+    let db = "7-series parts appear when the Project X-Ray database has them: download it from the part page of Create Project or with `helion-ide --fetch-xray-db`, or set HELION_XILINX_DB (see docs/xilinx-db.md)";
     if p.starts_with("xc7") {
         match list(&[Family::Xilinx7]) {
             x7 if x7.is_empty() => format!("{part}: no Project X-Ray database found, so no 7-series part can be implemented. {db}."),

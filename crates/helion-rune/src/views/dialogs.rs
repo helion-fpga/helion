@@ -350,6 +350,10 @@ pub struct CreateState {
     pub sources: Vec<String>,
     /// XDC/SDC files picked on the Add Constraints page.
     pub constraints: Vec<String>,
+    /// The Project X-Ray download in flight (part page's Download button).
+    pub xray: Option<std::sync::Arc<crate::xray::Job>>,
+    /// How the last download ended.
+    pub xray_msg: Option<String>,
 }
 
 impl CreateState {
@@ -379,6 +383,8 @@ impl Default for CreateState {
             error: None,
             sources: Vec::new(),
             constraints: Vec::new(),
+            xray: None,
+            xray_msg: None,
         }
     }
 }

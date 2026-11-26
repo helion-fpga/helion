@@ -51,3 +51,4 @@ serde_json = "1"
 # part registry / family flow dispatch (iCE40, ECP5, 7-series).
 helion-hls = { path = "../helion-hls" }
 helion-targets = { path = "../helion-targets" }
+helion-update = { workspace = true }

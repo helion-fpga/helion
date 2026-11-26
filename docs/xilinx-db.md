@@ -22,6 +22,22 @@ the bitstream would miss always-on configuration bits.
 
 ## Getting it
 
+The simplest way is to let Helion download it. It fetches one pinned commit
+of `openXC7/prjxray-db` (CC0-1.0; about 44 MB, 575 MB unpacked for
+`artix7`, `spartan7` and `zynq7`), checks every file against digests built
+into Helion, and only then puts each family in place:
+
+- IDE: **Create Project → part page → Download database** (with progress and Cancel).
+- Command line: `helion-ide --fetch-xray-db`. A `--headless` run on a 7-series
+  part asks first when the database is missing (at a terminal only; scripts
+  get the command to run instead).
+
+It installs into `HELION_XILINX_DB` when that is set, else
+`~/.cache/helion/prjxray-db`. A family directory you put there yourself is
+never replaced.
+
+To use your own checkout instead:
+
 Clone the prebuilt database (for example `f4pga/prjxray-db`) and point
 Helion at it:
 

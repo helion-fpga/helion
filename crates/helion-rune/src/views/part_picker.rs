@@ -73,6 +73,69 @@ fn xilinx_hidden_note(parts: &[helion_targets::TargetPart]) -> Option<String> {
     })
 }
 
+/// The download offer under the hidden-parts note: what it fetches and a
+/// Download button (the click is the consent), then progress and Cancel.
+fn xray_row(s: &AppState, t: &VivadoTheme, kit: &Kit) -> El {
+    use crate::views::dialogs::dlg_button;
+    let c = &s.dialogs.create;
+    let mut r = col().key("create-part-xray-row").w_full().gap(4.0);
+    if let Some(job) = &c.xray {
+        r = r.child(
+            row().w_full().items_center().gap(8.0).child(cad::dim(job.line(), t).key("create-part-xray-progress")).child(dlg_button(
+                "create-part-xray-cancel",
+                "Cancel",
+                false,
+                kit,
+                |s: &mut AppState| {
+                    if let Some(j) = &s.dialogs.create.xray {
+                        j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            )),
+        );
+    } else if let Some(root) = helion_update::xray_db::install_root() {
+        let missing = crate::xray::missing(&root);
+        if !missing.is_empty() {
+            r = r
+                .child(cad::dim(format!("{}.", crate::xray::consent(&root, &missing)), t).wrap().w_full().key("create-part-xray-consent"))
+                .child(dlg_button("create-part-xray-download", "Download database", true, kit, start_xray));
+        }
+    }
+    if let Some(m) = &c.xray_msg {
+        r = r.child(cad::dim(m.clone(), t).wrap().w_full().key("create-part-xray-msg"));
+    }
+    r
+}
+
+/// Start the X-Ray download on a worker. When it ends the part list is
+/// reloaded, keeping the picked part picked.
+pub fn start_xray(s: &mut AppState) {
+    let Some(root) = helion_update::xray_db::install_root() else {
+        s.dialogs.create.xray_msg = Some("No home directory to put the database in: set HELION_XILINX_DB to a directory.".into());
+        return;
+    };
+    let families = crate::xray::missing(&root);
+    let job = std::sync::Arc::new(crate::xray::Job::default());
+    let worker_job = job.clone();
+    let started = crate::bg::spawn(
+        s,
+        "xray-db",
+        move || crate::xray::fetch(&root, &families, &worker_job),
+        |s: &mut AppState, r: Result<String, String>| {
+            let c = &mut s.dialogs.create;
+            let picked = c.part_name().map(str::to_string);
+            c.xray = None;
+            c.xray_msg = Some(r.unwrap_or_else(|e| e));
+            c.catalog = PartCatalog::load();
+            c.part = picked.and_then(|p| c.catalog.parts.iter().position(|q| q.part == p)).unwrap_or(0);
+        },
+    );
+    if started {
+        s.dialogs.create.xray = Some(job);
+        s.dialogs.create.xray_msg = None;
+    }
+}
+
 /// Pick `board` (or none): selects the board's part.
 pub fn pick_board(s: &mut AppState, board: Option<String>) {
     let c = &mut s.dialogs.create;
@@ -198,7 +261,9 @@ pub fn part_page(s: &AppState, t: &VivadoTheme, kit: &Kit) -> El {
                 .child(col().w_full().max_h(200.0).scroll(ScrollSpec { stick_bottom: false }).child(list)),
         );
     if let Some(note) = xilinx_hidden_note(&c.catalog.parts) {
-        page = page.child(cad::dim(note, t).key("create-part-xray"));
+        page = page.child(cad::dim(note, t).wrap().w_full().key("create-part-xray")).child(xray_row(s, t, kit));
+    } else if let Some(m) = &c.xray_msg {
+        page = page.child(cad::dim(m.clone(), t).wrap().w_full().key("create-part-xray-msg"));
     }
     if let Some(b) = c.board.as_deref().and_then(|b| c.catalog.board(b)) {
         if b.pins.is_empty() {

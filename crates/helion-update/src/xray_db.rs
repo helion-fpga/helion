@@ -75,6 +75,29 @@ pub const FAMILIES: &[Family] = &[
     Family { name: "zynq7", files: 706, bytes: 272491312, digest: "e813e3eeac0f31da3ff7412b183bba5c1f680f29388e33268ef08ae94590c1fa" },
 ];
 
+/// Where Helion installs the database: `HELION_XILINX_DB` when set, else
+/// `~/.cache/helion/prjxray-db`, the first place the 7-series flow looks
+/// (`helion_xilinx7::device::default_db_root`). `None` with no home directory.
+pub fn install_root() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("HELION_XILINX_DB") {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|h| PathBuf::from(h).join(".cache/helion/prjxray-db"))
+}
+
+/// The database family a 7-series part is described in (`xc7z020clg484-1`:
+/// zynq7), or `None` for a part outside [`FAMILIES`].
+pub fn family_for_part(part: &str) -> Option<&'static Family> {
+    let p = part.to_ascii_lowercase();
+    let name = [("xc7z", "zynq7"), ("xc7a", "artix7"), ("xc7s", "spartan7")].into_iter().find(|(pre, _)| p.starts_with(pre))?.1;
+    FAMILIES.iter().find(|f| f.name == name)
+}
+
+/// Total unpacked size of `families`, for the consent prompt.
+pub fn unpacked_bytes(families: &[Family]) -> u64 {
+    families.iter().map(|f| f.bytes).sum()
+}
+
 /// URL of the pinned archive.
 pub fn archive_url() -> String {
     format!("https://codeload.github.com/{REPO}/tar.gz/{COMMIT}")
@@ -382,6 +405,15 @@ fn install_archive(archive: impl Read, root: &Path, stage: &Path, wanted: &[Fami
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parts_map_to_their_database_family() {
+        assert_eq!(family_for_part("xc7z020clg484-1").map(|f| f.name), Some("zynq7"));
+        assert_eq!(family_for_part("XC7A35T").map(|f| f.name), Some("artix7"));
+        assert_eq!(family_for_part("xc7s50csga324-1").map(|f| f.name), Some("spartan7"));
+        assert!(family_for_part("LFE5U-85F").is_none() && family_for_part("xc7k325t").is_none());
+        assert_eq!(unpacked_bytes(FAMILIES), 574_610_830);
+    }
 
     /// A gzip-compressed tar with `files` under a top-level `repo-abc/`.
     fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {

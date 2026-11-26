@@ -33,6 +33,7 @@ pub mod state;
 pub mod tcl;
 pub mod theme;
 pub mod views;
+pub mod xray;
 
 pub use state::AppState;
 pub use theme::{ThemeMode, VivadoTheme};

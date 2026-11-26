@@ -83,7 +83,12 @@ pub struct TargetPart {
     pub summary: String,
 }
 
-/// Root of the Project X-Ray database the xc7a35t backend needs.
+/// Where the 7-series flow reads the Project X-Ray database from.
+pub fn xilinx_db_root() -> std::path::PathBuf {
+    helion_xilinx7::device::default_db_root()
+}
+
+/// True when the X-Ray database the xc7a35t backend needs is there.
 pub fn xilinx_db_present() -> bool {
     helion_xilinx7::device::default_db_root()
         .join("artix7/xc7a50t/tilegrid.json")
