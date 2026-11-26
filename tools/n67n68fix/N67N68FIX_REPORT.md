@@ -160,9 +160,9 @@ rustfmt --check edition 2024 on tileconn_route.rs, lane vs base: both
 exit 1 with 8 hunks; normalized outputs differ only in the two changed
 lines. Zero new deviations.
 
-Branch diff 633327af..752ce8d5 is exactly 3 files, +63/-4 (plus the
-report copy, 252 lines added, counted separately below). No other file
-touched.
+Branch diff 633327af..752ce8d5 is exactly 3 files, +63/-4. The
+report copy (227 lines) is not in that diff; it arrives in commit
+f9fb18e7 (252 is the INTINTF report's line count). No other file touched.
 
 ## 7. New nits
 
