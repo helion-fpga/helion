@@ -265,6 +265,9 @@ pub struct RunArtifacts {
     pub family_die: Option<crate::runs_family::FamilyDie>,
     /// 7-series `.bit` on disk: Program Device loads it with openFPGALoader.
     pub bit_file: Option<PathBuf>,
+    /// Implementation view contract (7-series impl runs): what the Device
+    /// layers, heat maps and contract reports draw.
+    pub view: Option<helion_targets::view::ImplView>,
 }
 
 /// The live worker handle: its event channel plus the cancel flag the
@@ -313,6 +316,8 @@ pub struct RunsState {
     /// Die + placement of the last iCE40/ECP5 run (the Device view draws it
     /// for family parts instead of the HL10T canvas).
     pub family_die: Option<crate::runs_family::FamilyDie>,
+    /// View contract of the last implementation run that produced one.
+    pub impl_view: Option<helion_targets::view::ImplView>,
     /// Re-analysis context of the last successful run (`None` until one).
     pub analysis: Option<AnalysisCtx>,
     /// Finished runs, oldest first (Summary Run History card).
@@ -929,6 +934,9 @@ pub fn apply_artifacts(s: &mut AppState, art: RunArtifacts) {
     }
     if let Some(f) = art.family_die {
         s.runs.family_die = Some(f);
+    }
+    if let Some(v) = art.view {
+        s.runs.impl_view = Some(v);
     }
     if !art.part.is_empty() {
         if let Ok(dev) = helion_device::Device::load_part(&art.part) {
@@ -2893,6 +2901,7 @@ mod tests {
             ooc: Vec::new(),
             family_die: None,
             bit_file: None,
+            view: None,
         };
         deliver(&mut s, RunKind::Synth, RunEvent::Finished(Ok(art)));
         assert_eq!(s.flow.synth, RunStatus::Complete);

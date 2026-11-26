@@ -368,6 +368,7 @@ pub fn run_xdc_flow(source: &Path, part: &str, out_dir: &Path, send: &dyn Fn(Str
     let mut log = |l: &str| send(l.to_string(), MsgSev::Info);
     let b = helion_targets::xdc_flow::run(&design_arg, &xdc.display().to_string(), &bit.display().to_string(), top.as_deref(), false, "auto", part, None, &mut log)?
         .ok_or("xdc_flow stopped before routing")?;
+    let view = helion_targets::view_xilinx7::from_built(&b);
     let dev = b.backend.device();
     let p = &b.routed.placed.packed;
     let util = x7_util(p, dev, &stem);
@@ -392,6 +393,7 @@ pub fn run_xdc_flow(source: &Path, part: &str, out_dir: &Path, send: &dyn Fn(Str
         family_die,
         design: Some(b.design),
         bit_file: Some(bit.clone()),
+        view: Some(view),
         ..RunArtifacts::default()
     })
 }
@@ -467,6 +469,47 @@ mod tests {
         assert!(die.grid.count(helion_targets::reports::TileClass::Logic) > 1000);
         assert_eq!(die.placed.iter().filter(|p| p.class == helion_targets::reports::TileClass::Io).count(), 9);
         assert!(art.design.is_some(), "netlist for the schematic");
+    }
+
+    /// Guard: a ZedBoard implementation run fills the view contract from the
+    /// run itself (die, placement, routing, usage, timing, IO, clocks).
+    #[test]
+    fn zedboard_run_fills_the_impl_view_from_the_run() {
+        if !helion_targets::zynq_db_present() {
+            eprintln!("skipped: no zynq7 X-Ray database");
+            return;
+        }
+        let prj = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/zedboard_blinky.prj");
+        let dir = std::env::temp_dir().join(format!("helion-rune-view-{}", std::process::id()));
+        let art = run_xdc_flow(&prj, "xc7z020", &dir, &|_, _| {}).expect("xdc flow");
+        let _ = std::fs::remove_dir_all(&dir);
+        let v = art.view.expect("impl view");
+        assert_eq!(v.part, "xc7z020clg484-1");
+        assert!(v.tiles.len() > 10_000 && v.cols > 0 && v.rows > 0, "{} tiles", v.tiles.len());
+        let regions = v.clock_regions();
+        assert_eq!(regions.len(), 6, "xc7z020 has six clock regions in the database: {regions:?}");
+        assert!(v.provenance["tiles"].method.contains("tilegrid.json"), "regions read, not derived");
+        assert!(v.cells.iter().filter(|c| c.kind == "FF").count() >= 27, "27-bit counter placed");
+        assert!(v.cells.iter().all(|c| !c.site.is_empty()));
+        let routed: Vec<_> = v.nets.iter().filter(|n| !n.hops.is_empty()).collect();
+        assert!(!routed.is_empty(), "routed nets with hops");
+        assert!(routed.iter().any(|n| n.driver.is_some() && !n.loads.is_empty()), "router pins on nets");
+        assert!(v.usage.iter().any(|u| u.sites_used > 0), "per-tile site usage");
+        assert!(v.usage.iter().all(|u| u.sites_used <= u.sites_capacity), "sites counted once per site");
+        assert!(v.usage.iter().any(|u| u.overflow.is_some_and(|o| o.h_used + o.v_used > 0)), "per-tile wire usage");
+        let t = v.timing.as_ref().expect("timing");
+        assert!(t.total_endpoints >= 27 && t.endpoints.len() == t.total_endpoints, "every endpoint's slack");
+        assert!(t.endpoints.iter().all(|e| e.x.is_some()), "endpoints land on the die");
+        assert!(t.whs_ps.is_none() && v.missing.contains_key("hold"), "hold is named missing, not zero");
+        let io = v.io.as_ref().expect("io");
+        assert_eq!(io.pins.len(), 9, "clk + 8 LEDs");
+        assert!(io.pins.iter().all(|p| p.bank.is_some()), "bank from the package table");
+        let c = v.clocks.as_ref().expect("clocks");
+        assert_eq!(c.clocks.len(), 1);
+        assert!(c.clocks[0].loads >= 27 && !c.clocks[0].regions.is_empty() && c.clocks[0].buffer.is_some(), "{:?}", c.clocks[0]);
+        assert!(c.bufgs_used >= 1 && c.bufgs_available == 32);
+        assert!(!v.control_sets.is_empty() && !v.high_fanout.is_empty());
+        assert!(v.missing.contains_key("power"), "power names its missing input");
     }
 
     #[test]
