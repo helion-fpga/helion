@@ -41,10 +41,8 @@ use helion_xilinx7::xdc_flow::Built;
 
 use crate::Family;
 use crate::view::{
-    BoardGroup, BoardItem, BoardPanel, NetlistCell, NetlistPin, NetlistStage, SchematicNetlist,
-    CellPlacement, ClockNet, ClockUtilization, CongestionWindow, PowerBlock, PowerEstimate, TilePower, ControlSet, DrcViolation, EndpointSlack,
-    HighFanoutNet, ImplView, IoPin, IoPlan, Overflow, Provenance, ResourceRow, RoutedNet, Stage, TileClass,
-    TileUsage, TimingPath, TimingSummary, ViewTile, WireHop,
+    BoardGroup, BoardItem, BoardPanel, CellPlacement, ClockNet, ClockUtilization, CongestionWindow, ControlSet, EndpointSlack, HighFanoutNet, ImplView, IoPin, IoPlan, NetlistPin, Overflow,
+    PowerBlock, PowerEstimate, Provenance, ResourceRow, RoutedNet, Stage, TileClass, TilePower, TileUsage, TimingPath, TimingSummary, ViewTile, WireHop,
 };
 
 /// Scope string every section of a routed 7-series run carries.
@@ -791,56 +789,18 @@ pub fn fill_io(view: &mut ImplView, routed: &Routed7, design: &Design, dev: &Dev
                 IobDir::In => "input",
                 IobDir::Out => "output",
             },
+            iostandard_default: design.ports.iter().find(|p| helion_ir::resolve(p.name) == i.port).is_some_and(|p| p.attrs.get("IOSTANDARD").is_none()),
+            // The flow stops on a port without a PACKAGE_PIN.
+            pin_default: false,
+            clock_capable: dev.package_pin(loc).map(|p| p.pin_function.contains("MRCC") || p.pin_function.contains("SRCC")),
         });
     }
     pins.sort_by(|a, b| a.package_pin.cmp(&b.package_pin));
     view.io = Some(IoPlan { pins, package_pins: dev.package_pins().count() });
     view.set_provenance(
         "io",
-        Provenance::new("helion-xilinx7 pack", "placed IO buffers with their XDC PACKAGE_PIN and IOSTANDARD, bank from the package pin table", SCOPE),
+        Provenance::new("helion-xilinx7 pack", "placed IO buffers with their XDC PACKAGE_PIN and IOSTANDARD (LVCMOS33 when the XDC sets none), bank from the package pin table; clock capable when the pin function is MRCC or SRCC", SCOPE),
     );
-}
-
-/// Supply voltage an IO standard needs from its bank's VCCO, when the
-/// standard fixes one.
-fn vcco_of(iostandard: &str) -> Option<&'static str> {
-    let s = iostandard.to_ascii_uppercase();
-    Some(match s.as_str() {
-        "LVCMOS33" | "LVTTL" | "TMDS_33" => "3.3",
-        "LVCMOS25" | "LVDS_25" => "2.5",
-        "LVCMOS18" => "1.8",
-        "LVCMOS15" => "1.5",
-        "LVCMOS12" => "1.2",
-        _ => return None,
-    })
-}
-
-/// Bank VCCO consistency (Vivado rule BIVC-1): every IO standard placed in a
-/// bank must want the same VCCO.
-pub fn bank_vcco_drc(io: &IoPlan) -> Vec<(String, &'static str, String)> {
-    let mut by_bank: BTreeMap<u32, BTreeMap<&'static str, BTreeSet<&str>>> = BTreeMap::new();
-    for p in &io.pins {
-        if let (Some(b), Some(v)) = (p.bank, vcco_of(&p.iostandard)) {
-            by_bank.entry(b).or_default().entry(v).or_default().insert(p.port.as_str());
-        }
-    }
-    by_bank
-        .into_iter()
-        .filter(|(_, v)| v.len() > 1)
-        .map(|(bank, v)| {
-            let detail: Vec<String> = v.iter().map(|(volt, ports)| format!("{volt} V: {}", ports.iter().copied().collect::<Vec<_>>().join(", "))).collect();
-            ("BIVC-1".to_string(), "Error", format!("bank {bank} mixes VCCO levels ({})", detail.join("; ")))
-        })
-        .collect()
-}
-
-/// Fill DRC from the violations found and the rules that were run.
-pub fn fill_drc(view: &mut ImplView, items: &[(String, &'static str, String)], rules_run: &str) {
-    view.drc = items
-        .iter()
-        .map(|(rule, sev, msg)| DrcViolation { rule: rule.clone(), severity: sev, message: msg.clone() })
-        .collect();
-    view.set_provenance("drc", Provenance::new("helion-targets view", format!("rules run: {rules_run}"), SCOPE));
 }
 
 /// Fill the clock utilization panel.
@@ -926,16 +886,13 @@ pub fn from_built(b: &Built) -> ImplView {
     fill_control_sets(&mut v, &control_set_groups(&b.routed));
     let clock_names: HashSet<&str> = b.periods.keys().map(String::as_str).collect();
     fill_high_fanout(&mut v, &net_fanouts(&b.routed, &clock_names), 10);
-    let drc = v.io.as_ref().map(bank_vcco_drc).unwrap_or_default();
-    fill_drc(
-        &mut v,
-        &drc,
-        "BIVC-1 (bank VCCO consistency); the flow itself stops on a port without PACKAGE_PIN, packer overflow and unresolved routing overuse, so a finished run passed those",
-    );
     let toggle = b.design.attrs.get("DEFAULT_TOGGLE_RATE").and_then(|t| t.trim().trim_end_matches('%').parse::<f64>().ok()).map(|t| if t > 1.0 { t / 100.0 } else { t });
     fill_power(&mut v, &b.routed, &b.periods, toggle);
     fill_schematic(&mut v, b.rtl.as_ref(), &b.design);
     fill_board(&mut v);
+    // The flow itself stops on packer overflow and unresolved routing
+    // overuse, so a finished run passed those; the deck checks the rest.
+    crate::view_drc::fill(&mut v);
     v
 }
 
@@ -959,71 +916,20 @@ pub fn primitive_of(c: &helion_ir::Cell, pins: &[NetlistPin]) -> String {
     }
 }
 
-/// Whether a pin of a Helion IR cell drives its net: the cell's `OUT_PINS`
-/// list when it has one, else the 7-series output pin names.
-// shortcut: name-based for primitives without OUT_PINS; a new primitive with other output names reads as all inputs until it is listed here.
-pub fn is_output_pin(c: &helion_ir::Cell, pin: &str) -> bool {
-    if let Some(outs) = c.attrs.get("OUT_PINS") {
-        return outs.split(',').any(|o| o == pin);
-    }
-    if matches!(c.kind, helion_ir::CellKind::IobOut) {
-        return pin == "PAD";
-    }
-    let base = pin.split('[').next().unwrap_or(pin).trim_end_matches(|ch: char| ch.is_ascii_digit());
-    matches!(base, "O" | "Q" | "CO" | "P" | "PCOUT" | "ACOUT" | "BCOUT" | "CARRYOUT" | "DOADO" | "DOBDO" | "DOPADOP" | "DOPBDOP" | "LOCKED" | "CLKOUT" | "CLKFBOUT")
-}
+pub use crate::view_fill::is_output_pin;
 
 /// The three schematic netlists: elaborated, synthesized, and synthesized
 /// with the placement's site and BEL on each cell.
 pub fn fill_schematic(view: &mut ImplView, rtl: Option<&Design>, design: &Design) {
-    match rtl {
-        Some(r) => {
-            view.schematic.push(SchematicNetlist::from_ir(r, NetlistStage::Rtl, primitive_of, is_output_pin));
-            view.set_provenance(
-                NetlistStage::Rtl.section(),
-                Provenance::new("helion-sv v2", "elaborated word-level netlist before bit blasting: one cell per operator, register and constant", SCOPE),
-            );
-        }
-        None => view.mark_missing(
-            NetlistStage::Rtl.section(),
-            "the zb front end built this design (the v2 front end refused it); it keeps no elaborated netlist",
-        ),
-    }
-    let syn = SchematicNetlist::from_ir(design, NetlistStage::Synthesized, primitive_of, is_output_pin);
-    view.set_provenance(
-        NetlistStage::Synthesized.section(),
-        Provenance::new("helion-sv v2 lower", "the mapped netlist the packer reads (LUTs, flops, carry chains, IO and clock buffers)", SCOPE),
+    crate::view_fill::fill_schematic(
+        view,
+        rtl.ok_or("the zb front end built this design (the v2 front end refused it); it keeps no elaborated netlist"),
+        design,
+        primitive_of,
+        is_output_pin,
+        ("helion-sv v2", "helion-xilinx7 place"),
+        SCOPE,
     );
-    let mut imp = syn.clone();
-    imp.stage = NetlistStage::Implemented;
-    let at: HashMap<&str, &CellPlacement> = view.cells.iter().map(|c| (c.cell.as_str(), c)).collect();
-    let mut placed = 0usize;
-    for c in imp.cells.iter_mut() {
-        if let Some(p) = at.get(c.name.as_str()) {
-            c.site = Some(p.site.clone());
-            c.bel = p.bel.clone();
-            placed += 1;
-        }
-    }
-    let names: HashSet<&str> = syn.cells.iter().map(|c| c.name.as_str()).collect();
-    let mut added = 0usize;
-    for p in view.cells.iter().filter(|p| !names.contains(p.cell.as_str())) {
-        imp.cells.push(NetlistCell { name: p.cell.clone(), kind: p.kind.clone(), pins: Vec::new(), site: Some(p.site.clone()), bel: p.bel.clone() });
-        added += 1;
-    }
-    view.set_provenance(
-        NetlistStage::Implemented.section(),
-        Provenance::new(
-            "helion-xilinx7 place",
-            format!(
-                "synthesized netlist with the placement's site and BEL: {placed} of {} cells placed under their own name; {added} cells the packer made (buffers, split LUTs) carry a site but no pins",
-                syn.cells.len()
-            ),
-            SCOPE,
-        ),
-    );
-    view.schematic.push(syn);
-    view.schematic.push(imp);
 }
 
 /// Board part kind from the board pin file's port name.
@@ -1145,33 +1051,6 @@ mod tests {
     }
 
     #[test]
-    fn bank_vcco_rule_flags_only_a_bank_that_mixes_levels() {
-        let pin = |port: &str, bank: u32, std: &str| IoPin {
-            port: port.into(),
-            package_pin: String::new(),
-            bank: Some(bank),
-            iostandard: std.into(),
-            direction: "output",
-        };
-        let io = IoPlan {
-            pins: vec![
-                pin("a", 33, "LVCMOS33"),
-                pin("b", 33, "LVCMOS18"),
-                pin("c", 13, "LVCMOS33"),
-                pin("d", 13, "LVTTL"),
-                // A standard with no fixed VCCO is not judged.
-                pin("e", 34, "LVCMOS33"),
-                pin("f", 34, "DIFF_SSTL15"),
-            ],
-            package_pins: 0,
-        };
-        let v = bank_vcco_drc(&io);
-        assert_eq!(v.len(), 1, "{v:?}");
-        assert_eq!(v[0].0, "BIVC-1");
-        assert!(v[0].2.contains("bank 33") && v[0].2.contains("3.3 V: a") && v[0].2.contains("1.8 V: b"), "{}", v[0].2);
-    }
-
-    #[test]
     fn power_scales_with_frequency_and_toggle_and_lands_on_tiles() {
         use helion_xilinx7::place::PlacedFf;
         let mut v = ImplView::empty(FAMILY, "xc7z020clg484-1", ROUTED_STAGE);
@@ -1226,7 +1105,7 @@ mod tests {
     #[test]
     fn board_panel_joins_the_run_pins_to_the_board_parts_and_lists_the_rest() {
         let mut v = ImplView::empty(FAMILY, "xc7z020clg484-1", ROUTED_STAGE);
-        let pin = |port: &str, pin: &str| IoPin { port: port.into(), package_pin: pin.into(), bank: None, iostandard: "LVCMOS33".into(), direction: "output" };
+        let pin = |port: &str, pin: &str| IoPin { port: port.into(), package_pin: pin.into(), bank: None, iostandard: "LVCMOS33".into(), direction: "output", iostandard_default: false, pin_default: false, clock_capable: None };
         v.io = Some(IoPlan { pins: vec![pin("oled_dc", "U10"), pin("led", "T22"), pin("dbg", "A1")], package_pins: 0 });
         fill_board(&mut v);
         let b = v.board.as_ref().expect("ZedBoard panel");

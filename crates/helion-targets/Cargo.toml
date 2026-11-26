@@ -12,6 +12,10 @@ helion-backend = { workspace = true }
 helion-ice40 = { workspace = true }
 helion-ecp5 = { workspace = true }
 helion-xilinx7 = { workspace = true }
+helion-pack = { workspace = true }
+helion-place = { workspace = true }
+helion-route = { workspace = true }
+helion-sta = { workspace = true }
 
 [dev-dependencies]
 helion-sv = { workspace = true }

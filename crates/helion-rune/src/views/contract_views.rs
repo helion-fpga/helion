@@ -346,25 +346,34 @@ fn power(view: &ImplView) -> Panel {
 }
 
 fn drc(view: &ImplView) -> Panel {
-    if view.drc.is_empty() {
-        // An empty DRC list is a result (no violations) only when rules were
-        // run; the note names them.
-        if view.stage == Stage::Synthesized || view.missing.contains_key("drc") || !view.provenance.contains_key("drc") {
-            return missing(view, "drc", Report::Drc.title());
-        }
-        let rules = provenance_note(view, "drc").unwrap_or_default();
-        return Panel::table(Report::Drc.title(), Table::new(&["Rule", "Severity", "Message"]))
-            .with_note(format!("no violations; {rules}"));
+    // No deck means no rule ran: an empty list is then not a clean result.
+    if view.drc_rules.is_empty() && view.drc.is_empty() {
+        return missing(view, "drc", Report::Drc.title());
     }
     let mut tbl = Table::new(&["Rule", "Severity", "Message"]);
     for v in &view.drc {
         tbl.push(&[&v.rule, v.severity, &v.message]);
     }
-    let mut p = Panel::table(Report::Drc.title(), tbl);
-    if let Some(n) = provenance_note(view, "drc") {
-        p = p.with_note(n);
+    // The deck: every rule with its method, or why it did not run.
+    for r in &view.drc_rules {
+        let found = view.drc.iter().filter(|v| v.rule == r.id).count();
+        let origin = if r.vivado { "Vivado rule id" } else { "Helion rule" };
+        match &r.not_run {
+            Some(why) => tbl.push(&[r.id, "not run", &format!("{}: {why}", r.title)]),
+            None => tbl.push(&[r.id, if found == 0 { "checked, clean" } else { "checked" }, &format!("{} ({origin}): {}", r.title, r.method)]),
+        }
     }
-    p
+    let ran = view.drc_rules.iter().filter(|r| r.not_run.is_none()).count();
+    Panel::table(Report::Drc.title(), tbl).with_note(format!("{} violation(s); {ran} of {} rules run on this view's contract", view.drc.len(), view.drc_rules.len()))
+}
+
+/// Unique control sets as a share of the part's slices, in percent, with
+/// the guideline band. UG949 (control set guidelines, 7 series): under
+/// 7.5% of the slices is acceptable, 7.5 to 15 noted, 15 to 25 needs
+/// analysis, over 25 a design change is recommended.
+fn control_set_band(sets: usize, slices: u32) -> (f64, &'static str) {
+    let pct = 100.0 * sets as f64 / slices.max(1) as f64;
+    (pct, if pct < 7.5 { "pass" } else if pct < 15.0 { "note" } else if pct < 25.0 { "warn" } else { "fail" })
 }
 
 fn methodology(view: &ImplView) -> Panel {
@@ -372,11 +381,33 @@ fn methodology(view: &ImplView) -> Panel {
     // and IO. Each check states its own result.
     let mut tbl = Table::new(&["Check", "Result", "Detail"]);
     let cs = view.control_sets.len();
-    tbl.push(&[
-        "Control set count",
-        if cs == 0 { "n/a" } else if cs <= 8 { "pass" } else { "warn" },
-        &format!("{cs} distinct control sets"),
-    ]);
+    let slices = view.resources.iter().find(|r| r.name == "Slice").map(|r| r.available).filter(|n| *n > 0);
+    match slices {
+        Some(n) => {
+            let (pct, band) = control_set_band(cs, n);
+            tbl.push(&[
+                "Control set count",
+                band,
+                &format!("{cs} control sets, {pct:.2}% of {n} slices (UG949: under 7.5% acceptable, 7.5 to 15 noted, 15 to 25 analysis, over 25 redesign)"),
+            ]);
+        }
+        None => tbl.push(&[
+            "Control set count",
+            "n/a",
+            &format!("{cs} control sets; the UG949 threshold is a share of 7-series slices and {} has no published guideline", view.family.label()),
+        ]),
+    }
+    match &view.timing {
+        Some(t) => {
+            let hold = match t.whs_ps {
+                Some(w) => format!("WHS {} ns", fmt_ps(w)),
+                None => format!("hold not checked: {}", view.missing.get("hold").map(String::as_str).unwrap_or("the engine timed no hold endpoint")),
+            };
+            let met = t.wns_ps >= 0 && t.whs_ps.is_none_or(|w| w >= 0);
+            tbl.push(&["Timing met", if met { "pass" } else { "fail" }, &format!("WNS {} ns, {} of {} endpoints failing; {hold}", fmt_ps(t.wns_ps), t.failing_endpoints, t.total_endpoints)]);
+        }
+        None => tbl.push(&["Timing met", "n/a", &format!("not timed: {}", view.missing.get("timing").map(String::as_str).unwrap_or("no timing in this run"))]),
+    }
     let max_fanout = view.high_fanout.first().map(|n| n.fanout).unwrap_or(0);
     tbl.push(&[
         "High fanout",
@@ -413,7 +444,7 @@ fn methodology(view: &ImplView) -> Panel {
         ),
     ]);
     Panel::table(Report::Methodology.title(), tbl)
-        .with_note("derived from the view contract: control sets, fanout, clocks, routing".to_string())
+        .with_note("derived from the view contract: control sets, timing, fanout, clocks, routing; Helion's own checks (HLN-METH), not Vivado's report_methodology rule deck".to_string())
 }
 
 fn design_analysis(view: &ImplView) -> Panel {
@@ -473,7 +504,7 @@ fn clock_utilization(view: &ImplView) -> Panel {
     for c in &cu.clocks {
         tbl.push(&[
             &c.name,
-            &format!("{:.2}", c.period_ps as f64 / 1000.0),
+            &if c.period_ps == 0 { "unconstrained".to_string() } else { format!("{:.2}", c.period_ps as f64 / 1000.0) },
             &c.loads.to_string(),
             c.buffer.as_deref().unwrap_or(""),
             &c.regions.join(","),
@@ -671,39 +702,32 @@ pub fn heat_map(view: &ImplView, which: HeatMap) -> Vec<HotTile> {
     }
 }
 
-fn slack_heat(view: &ImplView) -> Vec<HotTile> {
-    let Some(t) = &view.timing else {
-        return Vec::new();
-    };
-    // Slack is mapped to 0..100% as "how much of the requirement is consumed":
-    // negative slack reads above 100, which is the same convention as the
-    // congestion maps, so one colour ramp serves every heat map.
-    let req = t
-        .worst_path
-        .as_ref()
-        .map(|p| p.requirement_ps)
-        .filter(|r| *r > 0)
-        .unwrap_or(0);
-    if req == 0 {
-        return Vec::new();
-    }
-    // One value per tile: the worst endpoint slack in it.
-    let mut worst: BTreeMap<(u32, u32), i64> = BTreeMap::new();
+/// Worst endpoint slack per tile, in ps, with that endpoint's requirement
+/// (its clock's period; the worst path's requirement when the clock is not
+/// in the clock table).
+pub fn slack_by_tile(view: &ImplView) -> BTreeMap<(u32, u32), (i64, i64)> {
+    let Some(t) = &view.timing else { return BTreeMap::new() };
+    let fallback = t.worst_path.as_ref().map(|p| p.requirement_ps).unwrap_or(0);
+    let period = |clock: &str| view.clocks.iter().flat_map(|c| &c.clocks).find(|c| c.name == clock).map(|c| c.period_ps as i64).filter(|p| *p > 0).unwrap_or(fallback);
+    let mut worst: BTreeMap<(u32, u32), (i64, i64)> = BTreeMap::new();
     for e in &t.endpoints {
-        let (Some(x), Some(y)) = (e.x, e.y) else {
-            continue;
-        };
-        let w = worst.entry((x, y)).or_insert(e.slack_ps);
-        *w = (*w).min(e.slack_ps);
+        let (Some(x), Some(y)) = (e.x, e.y) else { continue };
+        let w = worst.entry((x, y)).or_insert((e.slack_ps, period(&e.clock)));
+        if e.slack_ps < w.0 {
+            *w = (e.slack_ps, period(&e.clock));
+        }
     }
     worst
+}
+
+fn slack_heat(view: &ImplView) -> Vec<HotTile> {
+    // Slack is mapped to 0..100% as "how much of the requirement is consumed":
+    // negative slack reads above 100, the same convention as the congestion
+    // maps, so one colour ramp serves every heat map.
+    slack_by_tile(view)
         .into_iter()
-        .map(|((x, y), slack)| HotTile {
-            x,
-            y,
-            value: 100.0 * (req - slack).max(0) as f32 / req as f32,
-            overused: slack < 0,
-        })
+        .filter(|(_, (_, req))| *req > 0)
+        .map(|((x, y), (slack, req))| HotTile { x, y, value: 100.0 * (req - slack).max(0) as f32 / req as f32, overused: slack < 0 })
         .collect()
 }
 
@@ -725,9 +749,11 @@ fn power_heat(view: &ImplView) -> Vec<HotTile> {
 pub fn heat_panel(view: &ImplView, which: HeatMap) -> Panel {
     let tiles = heat_map(view, which);
     if tiles.is_empty() {
+        let named = |keys: &[&str]| keys.iter().find_map(|k| view.missing.get(*k).cloned());
         let reason = match which {
-            HeatMap::Power => "no power estimate with dynamic power on placed cells in this run",
-            _ => "no routed data in this run to compute the map",
+            HeatMap::Power => named(&["power", "power-tiles"]).unwrap_or_else(|| "no power estimate with dynamic power on placed cells in this run".into()),
+            HeatMap::Slack => named(&["timing", "endpoint-slack"]).unwrap_or_else(|| "no timed endpoint is placed on the die in this run".into()),
+            _ => named(&["routing"]).unwrap_or_else(|| "no routed data in this run to compute the map".into()),
         };
         return Panel::missing(which.title(), reason);
     }
@@ -749,6 +775,15 @@ pub fn heat_panel(view: &ImplView, which: HeatMap) -> Panel {
             tiles.len(),
             pw.tiles.first().map(|t| t.mw).unwrap_or(0.0)
         ),
+        (HeatMap::Slack, _) => {
+            let worst = slack_by_tile(view).into_iter().min_by_key(|(_, v)| v.0);
+            format!(
+                "{} tiles with a timed endpoint, {over} failing; value is the share of the clock period the tile's worst endpoint uses; worst slack {} ns at {:?}",
+                tiles.len(),
+                worst.map(|(_, v)| fmt_ps(v.0)).unwrap_or_default(),
+                worst.map(|(xy, _)| xy).unwrap_or_default()
+            )
+        }
         _ => format!("{} tiles, {} over capacity, max {:.1}%", tiles.len(), over, max),
     };
     Panel::table(which.title(), tbl).with_note(note)
@@ -821,7 +856,7 @@ pub fn layer_panel(view: &ImplView, layer: Layer) -> Panel {
             if regions.is_empty() {
                 return Panel::missing(
                     layer.title(),
-                    "the device model has no clock-region table for this part",
+                    view.missing.get("clock-regions").cloned().unwrap_or_else(|| "the device model has no clock-region table for this part".into()),
                 );
             }
             let mut tbl = Table::new(&["Region", "Tiles"]);
@@ -1183,6 +1218,113 @@ mod tests {
         assert!(text.contains("0.8000 mW"), "{text}");
         let text = power(&v).render();
         assert!(text.contains("105.000") && text.contains("Registers"), "{text}");
+    }
+
+    fn timed(endpoints: &[(&str, i64, &str, u32, u32)]) -> TimingSummary {
+        TimingSummary {
+            wns_ps: endpoints.iter().map(|e| e.1).min().unwrap_or(0),
+            tns_ps: endpoints.iter().map(|e| e.1.min(0)).sum(),
+            whs_ps: None,
+            ths_ps: None,
+            failing_endpoints: endpoints.iter().filter(|e| e.1 < 0).count(),
+            total_endpoints: endpoints.len(),
+            worst_path: Some(TimingPath { from: "a".into(), to: "b".into(), clock: "clk".into(), slack_ps: 0, requirement_ps: 10_000, kind: "setup" }),
+            worst_hold_path: None,
+            endpoints: endpoints
+                .iter()
+                .map(|e| helion_targets::view::EndpointSlack { endpoint: e.0.into(), slack_ps: e.1, clock: e.2.into(), site: None, x: Some(e.3), y: Some(e.4) })
+                .collect(),
+            fmax_mhz: None,
+        }
+    }
+
+    #[test]
+    fn slack_heat_map_paints_each_tile_with_its_worst_endpoint() {
+        let mut v = sample();
+        // Two endpoints share tile (0, 0): the worse one wins. Tile (1, 0)
+        // fails. The endpoint on the 4 ns clock is judged against 4 ns.
+        v.timing = Some(timed(&[("f0.D", 6_000, "clk", 0, 0), ("f1.D", 2_500, "clk", 0, 0), ("f2.D", -500, "clk", 1, 0), ("f3.D", 1_000, "fast", 1, 1)]));
+        v.clocks = Some(helion_targets::view::ClockUtilization {
+            clocks: vec![
+                helion_targets::view::ClockNet { name: "clk".into(), period_ps: 10_000, loads: 3, regions: vec![], buffer: None },
+                helion_targets::view::ClockNet { name: "fast".into(), period_ps: 4_000, loads: 1, regions: vec![], buffer: None },
+            ],
+            loads_by_region: BTreeMap::new(),
+            bufgs_used: 0,
+            bufgs_available: 0,
+        });
+        assert_eq!(slack_by_tile(&v).get(&(0, 0)), Some(&(2_500, 10_000)));
+        let mut t = heat_map(&v, HeatMap::Slack);
+        t.sort_by_key(|h| (h.x, h.y));
+        assert_eq!(t.iter().map(|h| (h.x, h.y, h.value, h.overused)).collect::<Vec<_>>(), vec![(0, 0, 75.0, false), (1, 0, 105.0, true), (1, 1, 75.0, false)]);
+        let text = heat_panel(&v, HeatMap::Slack).render();
+        assert!(text.contains("3 tiles with a timed endpoint, 1 failing") && text.contains("worst slack -0.500 ns at (1, 0)"), "{text}");
+        // An endpoint with no place on the die is not painted anywhere.
+        v.timing.as_mut().unwrap().endpoints[2].x = None;
+        assert_eq!(heat_map(&v, HeatMap::Slack).len(), 2);
+        // No timing: the map names the run's own reason.
+        v.timing = None;
+        v.mark_missing("timing", "no create_clock constraint reaches a flop's clock");
+        assert_eq!(heat_panel(&v, HeatMap::Slack).body, PanelBody::Missing("no create_clock constraint reaches a flop's clock".into()));
+    }
+
+    #[test]
+    fn drc_report_lists_violations_then_every_rule_with_its_method_or_reason() {
+        use helion_targets::view::{DrcRule, DrcViolation};
+        let mut v = sample();
+        assert!(matches!(drc(&v).body, PanelBody::Missing(_)), "no deck ran: not a clean result");
+        v.drc_rules = vec![
+            DrcRule { id: "NSTD-1", vivado: true, title: "Unspecified I/O standard", method: "pins on the default standard", not_run: None },
+            DrcRule { id: "HLN-NDRV", vivado: false, title: "Undriven net with loads", method: "nets with loads and no driver", not_run: None },
+            DrcRule { id: "ZPS7-1", vivado: true, title: "PS7 block required", method: "a Zynq part with no PS7", not_run: Some("not a Zynq-7000 part".into()) },
+        ];
+        v.drc = vec![DrcViolation { rule: "NSTD-1".into(), severity: "Critical Warning", message: "1 port(s) have no IOSTANDARD".into() }];
+        let p = drc(&v);
+        let PanelBody::Table(t) = &p.body else { panic!("a table") };
+        assert_eq!(t.rows[0], vec!["NSTD-1", "Critical Warning", "1 port(s) have no IOSTANDARD"]);
+        assert_eq!(t.rows[1][..2], ["NSTD-1".to_string(), "checked".to_string()]);
+        assert!(t.rows[1][2].contains("Vivado rule id") && t.rows[1][2].contains("pins on the default standard"));
+        assert!(t.rows[2][1] == "checked, clean" && t.rows[2][2].contains("Helion rule"));
+        assert_eq!(t.rows[3], vec!["ZPS7-1", "not run", "PS7 block required: not a Zynq-7000 part"]);
+        assert_eq!(p.note.as_deref(), Some("1 violation(s); 2 of 3 rules run on this view's contract"));
+    }
+
+    #[test]
+    fn methodology_states_the_control_set_threshold_and_whether_timing_met() {
+        // UG949 bands on a 1000-slice part.
+        assert_eq!(control_set_band(74, 1000).1, "pass");
+        assert_eq!(control_set_band(75, 1000).1, "note");
+        assert_eq!(control_set_band(150, 1000).1, "warn");
+        assert_eq!(control_set_band(251, 1000).1, "fail");
+        let mut v = sample();
+        let text = methodology(&v).render();
+        assert!(text.contains("no published guideline") && text.contains("Timing met") && text.contains("not timed"), "{text}");
+        v.resources.push(helion_targets::view::ResourceRow { name: "Slice".into(), depth: 0, used: 10.0, available: 13_300 });
+        v.control_sets = (0..1000).map(|i| helion_targets::view::ControlSet { key: (format!("c{i}"), String::new(), String::new(), String::new()), flops: vec![] }).collect();
+        v.timing = Some(timed(&[("f0.D", -200, "clk", 0, 0), ("f1.D", 300, "clk", 0, 0)]));
+        v.mark_missing("hold", "one corner");
+        let text = methodology(&v).render();
+        assert!(text.contains("1000 control sets, 7.52% of 13300 slices") && text.contains("note"), "{text}");
+        assert!(text.contains("fail") && text.contains("WNS -0.200 ns, 1 of 2 endpoints failing; hold not checked: one corner"), "{text}");
+    }
+
+    #[test]
+    fn an_unconstrained_clock_and_a_family_without_regions_say_so() {
+        let mut v = sample();
+        v.clocks = Some(helion_targets::view::ClockUtilization {
+            clocks: vec![helion_targets::view::ClockNet { name: "osc".into(), period_ps: 0, loads: 2, regions: vec![], buffer: None }],
+            loads_by_region: BTreeMap::new(),
+            bufgs_used: 1,
+            bufgs_available: 8,
+        });
+        assert!(clock_utilization(&v).render().contains("unconstrained"));
+        for t in v.tiles.iter_mut() {
+            t.clock_region.clear();
+        }
+        v.mark_missing("clock-regions", "this family has no clock regions");
+        assert_eq!(layer_panel(&v, Layer::ClockRegions).body, PanelBody::Missing("this family has no clock regions".into()));
+        v.mark_missing("power-tiles", "the model attributes nothing to a tile");
+        assert_eq!(heat_panel(&v, HeatMap::Power).body, PanelBody::Missing("the model attributes nothing to a tile".into()));
     }
 
     #[test]

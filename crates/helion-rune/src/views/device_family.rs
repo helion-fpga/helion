@@ -3,8 +3,10 @@
 //! family placer's primitives on it. After a 7-series implementation run the
 //! die is drawn from the run's view contract instead (`runs.impl_view`):
 //! placed cells, routing, clock regions and IO banks as layers, with the
-//! utilization and H/V congestion heat maps. HL10T parts keep the HAD-model
-//! canvas in [`crate::views::device`].
+//! utilization, H/V congestion, slack and power heat maps. Every family's
+//! implementation run fills that contract; HL10T parts keep the HAD-model
+//! canvas in [`crate::views::device`] and show the contract view on its
+//! Implemented tab.
 
 use std::collections::HashMap;
 
@@ -217,6 +219,7 @@ fn view_controls(s: &AppState, t: &VivadoTheme) -> El {
     let mut r = row()
         .key("device-view-layers")
         .w_full()
+        .flex_wrap()
         .gap(10.0)
         .items_center()
         .child(check("device-view-cells", "Placed cells", l.cells, |s| s.device.layers.cells = !s.device.layers.cells))
@@ -230,6 +233,8 @@ fn view_controls(s: &AppState, t: &VivadoTheme) -> El {
         (Some(HeatMap::Utilization), "Utilization", "device-view-heat-util"),
         (Some(HeatMap::CongestionH), "Congestion H", "device-view-heat-cong-h"),
         (Some(HeatMap::CongestionV), "Congestion V", "device-view-heat-cong-v"),
+        (Some(HeatMap::Slack), "Slack", "device-view-heat-slack"),
+        (Some(HeatMap::Power), "Power", "device-view-heat-power"),
     ];
     for (mode, label, key) in modes {
         r = r.child(cad::tab(key, label, s.device.view_heat == mode, t, move |s: &mut AppState| s.device.view_heat = mode));
@@ -368,7 +373,7 @@ fn shared_prefix(labels: &[&str], label_w: f32) -> usize {
     if labels.iter().all(|l| l.is_char_boundary(n)) { n } else { 0 }
 }
 
-/// Device pane body for a 7-series run's view contract.
+/// Device pane body for a run's view contract.
 fn view_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
     let z = s.device.zoom.max(0.25);
     // Before the first layout reports the canvas size, fit to the default
@@ -448,6 +453,21 @@ fn view_body(v: &ImplView, s: &AppState, t: &VivadoTheme) -> El {
                 })
                 .child(world)
         })
+}
+
+/// The contract view of an HL10 run, beside its HAD canvas (the Device
+/// toolbar's Implemented tab): the same layers and heat maps every family
+/// draws. Before an implementation run it says what is missing.
+pub fn implemented_body(s: &AppState, t: &VivadoTheme) -> El {
+    match s.runs.impl_view.as_ref().filter(|v| v.part.eq_ignore_ascii_case(&s.project.part)) {
+        Some(v) => view_body(v, s, t),
+        None => cad::empty_state(
+            "device-impl-empty",
+            &format!("No implemented design for {}: run implementation to place and route it, then its layers and heat maps draw here.", s.project.part),
+            None,
+            t,
+        ),
+    }
 }
 
 /// Device pane body for a family part.

@@ -75,6 +75,30 @@ fn headless_lone_sv_with_xdc_on_a_7series_part() {
     assert!(s.lines().any(|l| l.starts_with("WNS_PS=")), "{s}");
 }
 
+/// Every family's headless run prints the report set a 7-series run
+/// prints: the eleven reports, the device layers and heat maps, the
+/// schematic and board summary, the usage line and the WNS.
+#[test]
+fn headless_prints_the_same_report_set_for_hl10_ice40_and_ecp5() {
+    for (file, head) in [("counter.prj", "Helion HL10T-C32-1 Routed"), ("ice40_counter.prj", "Lattice iCE40 ice40-hx8k Routed"), ("ecp5_counter.prj", "Lattice ECP5 LFE5U-85F Routed")] {
+        let out = Command::new(bin()).arg("--headless").arg(example(file)).output().unwrap();
+        let s = stdout(&out);
+        assert!(out.status.success(), "{file}: {s}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(s.starts_with(head), "{file}: {s}");
+        for title in [
+            "Timing Summary", "Utilization", "Power", "Design Rule Check", "Methodology", "Design Analysis", "Clock Utilization", "Control Sets", "I/O Report", "High Fanout Nets", "Route Status",
+            "Placed cells", "Routing", "Clock regions", "IO banks", "Package", "Congestion (horizontal)", "Congestion (vertical)", "Timing slack", "Power by tile",
+        ] {
+            assert!(s.lines().any(|l| l == title), "{file}: no {title} section: {s}");
+        }
+        for line in ["SCHEMATIC_RTL:", "SCHEMATIC_SYNTHESIZED:", "SCHEMATIC_IMPLEMENTED:", "BOARD:", "WNS_PS="] {
+            assert!(s.lines().any(|l| l.starts_with(line)), "{file}: no {line} line: {s}");
+        }
+        assert!(s.contains("WNS (ns)") && s.contains("sites, 0 tiles over capacity"), "{file}: {s}");
+        assert!(!s.contains("not available"), "{file}: a section names its missing input instead: {s}");
+    }
+}
+
 #[test]
 fn headless_missing_file_fails() {
     let out = Command::new(bin())

@@ -22,6 +22,11 @@
 
 pub mod reports;
 pub mod view;
+pub mod view_drc;
+pub mod view_ecp5;
+pub mod view_fill;
+pub mod view_hl10;
+pub mod view_ice40;
 pub mod view_xilinx7;
 
 use helion_backend::Backend;
@@ -132,6 +137,13 @@ pub fn implementable_parts() -> Vec<TargetPart> {
             family: Family::Xilinx7,
             summary: "53200 LUT6 · 140 BRAM36 · 220 DSP · clg484, ZedBoard (X-Ray)".into(),
         });
+    }
+    // Every other board in the board table, so its board picture comes with it.
+    for b in helion_xilinx7::parts::BOARDS {
+        let db = if b.part.starts_with("xc7z") { zynq_db_present() } else { xilinx_db_present() };
+        if db && !out.iter().any(|p| p.part.eq_ignore_ascii_case(b.part)) {
+            out.push(TargetPart { part: b.part.into(), family: Family::Xilinx7, summary: format!("{}, {} (X-Ray)", b.part, b.title) });
+        }
     }
     out
 }
@@ -248,6 +260,18 @@ pub fn implement(
     part: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<FamilyBitstream, String> {
+    implement_view(design, part, &[], progress).map(|r| r.0)
+}
+
+/// [`implement`], plus the run's view contract for iCE40 and ECP5 parts
+/// (`None` for 7-series, whose view comes from [`xdc_flow`]). `clocks` are
+/// the constrained clocks as `(source port or net, period in ps)`.
+pub fn implement_view(
+    design: &Design,
+    part: &str,
+    clocks: &[(String, u32)],
+    progress: &mut dyn FnMut(&str),
+) -> Result<(FamilyBitstream, Option<view::ImplView>), String> {
     let family = family_of(part).ok_or_else(|| format!("no backend implements part {part}"))?;
     let mut owned = design.clone();
     let pads = insert_io_buffers(&mut owned)?;
@@ -264,6 +288,7 @@ pub fn implement(
     if pads > 0 {
         stage("io", format!("{pads} I/O buffer(s) inserted"), progress);
     }
+    let mut view = None;
     let text = match family {
         Family::Helion => {
             return Err(format!("{part} is a Helion part: run the HL10T flow"));
@@ -278,6 +303,7 @@ pub fn implement(
             stage("route", "routed".into(), progress);
             let asc = b.bitstream(&routed)?;
             stage("bitstream", format!("{} lines of .asc", asc.lines().count()), progress);
+            view = Some(view_ice40::from_routed(part, design, &routed, b.router(), clocks));
             asc
         }
         Family::Ecp5 => {
@@ -290,6 +316,7 @@ pub fn implement(
             stage("route", "routed".into(), progress);
             let cfg = b.bitstream(&routed)?;
             stage("bitstream", format!("{} lines of Trellis config", cfg.textcfg.lines().count()), progress);
+            view = Some(view_ecp5::from_routed(part, design, b.device(), &placed, &routed, clocks));
             cfg.textcfg
         }
         Family::Xilinx7 => {
@@ -305,13 +332,16 @@ pub fn implement(
             bs.fasm.join("\n")
         }
     };
-    Ok(FamilyBitstream {
-        family,
-        part: part.to_string(),
-        ext,
-        text,
-        stages,
-    })
+    Ok((
+        FamilyBitstream {
+            family,
+            part: part.to_string(),
+            ext,
+            text,
+            stages,
+        },
+        view,
+    ))
 }
 
 #[cfg(test)]
@@ -346,6 +376,10 @@ mod tests {
         assert_eq!(parts.iter().any(|p| p.part == "xc7a35t"), xilinx_db_present());
         assert_eq!(parts.iter().any(|p| p.part == ZEDBOARD_PART), zynq_db_present());
         assert_eq!(family_of("xc7z020"), zynq_db_present().then_some(Family::Xilinx7));
+        for b in helion_xilinx7::parts::BOARDS {
+            let db = if b.part.starts_with("xc7z") { zynq_db_present() } else { xilinx_db_present() };
+            assert_eq!(parts.iter().filter(|p| p.part == b.part).count(), db as usize, "{} must be pickable once", b.name);
+        }
         for p in parts.iter().filter(|p| p.family == Family::Helion) {
             assert!(helion_device::Device::load_part(&p.part).is_ok());
         }

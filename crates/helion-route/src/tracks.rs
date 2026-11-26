@@ -69,6 +69,21 @@ pub struct TrackRoutes {
     pub pin_hops: Vec<(u32, u32, u32, u32)>,
     /// The same for wire-fed output pads: (x, y, wires).
     pub pad_hops: Vec<(u32, u32, u32)>,
+    /// Every wire a routed net occupies, with the net's driver. Unlike `sb`
+    /// this includes the wires an input pad drives itself. Not stored in
+    /// checkpoints: empty on a reopened design.
+    pub net_wires: Vec<NetWire>,
+}
+
+/// One interconnect wire and the net on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetWire {
+    pub x: u32,
+    pub y: u32,
+    /// `helion_device::tracks` direction (N, E, S, W).
+    pub dir: u8,
+    pub track: u8,
+    pub src: NetSrc,
 }
 
 /// How an output pad gets its signal.
@@ -634,9 +649,13 @@ pub(crate) fn route(placed: &Placed, dev: &Device) -> Result<Routing, String> {
 
     // Results.
     let mut out = TrackRoutes { active: true, iob_in, nets: routed_nets, iters: rounds, undriven: conn.undriven.len() as u32, ..Default::default() };
+    let src_of: HashMap<usize, NetSrc> = net_of.iter().map(|(s, i)| (*i, *s)).collect();
     for (ni, net) in nets.iter().enumerate() {
         for &(w, p) in &tree[ni] {
             let (x, y, dir, track) = grid.parts(w);
+            if let Some(&src) = src_of.get(&ni) {
+                out.net_wires.push(NetWire { x, y, dir: dir as u8, track: track as u8, src });
+            }
             let sel = if p == u32::MAX {
                 match net.src {
                     Src::Ble { sel, .. } => sel as u32,

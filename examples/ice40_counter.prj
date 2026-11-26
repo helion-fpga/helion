@@ -1,0 +1,4 @@
+# Helion project: the 4-bit counter on the iCE40-HX8K breakout board
+part ice40-hx8k
+read_sv examples/counter.sv
+read_xdc examples/ice40_counter.xdc

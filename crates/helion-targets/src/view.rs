@@ -162,7 +162,9 @@ pub struct RoutedNet {
     /// dedicated cascade (recorded in `kind`).
     pub hops: Vec<WireHop>,
     /// How the net is implemented: `"pips"`, `"site-internal"`,
-    /// `"clock-spine"`, `"cascade"`, `"cascade-dedicated"`, `"unrouted"`.
+    /// `"clock-spine"`, `"cascade"`, `"cascade-dedicated"`, `"unrouted"`,
+    /// `"direct"` (a dedicated neighbour connection, no interconnect
+    /// wire), `"global"` (a global clock network), `"constant"`.
     pub kind: &'static str,
 }
 
@@ -408,6 +410,14 @@ pub struct IoPin {
     pub iostandard: String,
     /// `"input"`, `"output"`, `"inout"`.
     pub direction: &'static str,
+    /// The flow chose the standard: the constraints gave none.
+    pub iostandard_default: bool,
+    /// The flow chose the pin: the constraints gave no location.
+    pub pin_default: bool,
+    /// Whether the pin can drive a global clock network, when the device
+    /// model says; the reason it does not is in [`ImplView::missing`] under
+    /// `"clock-capable"`.
+    pub clock_capable: Option<bool>,
 }
 
 /// IO planning data.
@@ -478,6 +488,21 @@ pub struct DrcViolation {
     pub rule: String,
     pub severity: &'static str,
     pub message: String,
+}
+
+/// One rule of the DRC deck: what it checks, how, and whether it ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrcRule {
+    /// The rule's id as violations carry it: the Vivado rule id where the
+    /// rule is Vivado's, a `HLN-` id where it is Helion's own.
+    pub id: &'static str,
+    /// True when `id` is a Vivado `report_drc` rule id.
+    pub vivado: bool,
+    pub title: &'static str,
+    /// How Helion computes it from the view contract.
+    pub method: &'static str,
+    /// Why the rule did not run on this view; `None` when it ran.
+    pub not_run: Option<String>,
 }
 
 /// The board panel: every part of the board's own pin file, and what the
@@ -731,6 +756,8 @@ pub struct ImplView {
     pub high_fanout: Vec<HighFanoutNet>,
     /// DRC results.
     pub drc: Vec<DrcViolation>,
+    /// The DRC deck: every rule, run or not.
+    pub drc_rules: Vec<DrcRule>,
     /// Board panel, when the project pins a known board.
     pub board: Option<BoardPanel>,
     /// The design's netlist at each stage the run kept, in stage order.
@@ -769,6 +796,7 @@ impl ImplView {
             control_sets: Vec::new(),
             high_fanout: Vec::new(),
             drc: Vec::new(),
+            drc_rules: Vec::new(),
             board: None,
             schematic: Vec::new(),
             layers: Layers::default(),

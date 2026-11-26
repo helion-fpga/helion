@@ -163,15 +163,18 @@ pub enum DeviceView {
     #[default]
     Die,
     Package,
+    /// The implementation run's view contract: layers, heat maps, board.
+    Implemented,
 }
 
 impl DeviceView {
-    pub const ALL: [DeviceView; 2] = [DeviceView::Die, DeviceView::Package];
+    pub const ALL: [DeviceView; 3] = [DeviceView::Die, DeviceView::Package, DeviceView::Implemented];
 
     pub fn label(self) -> &'static str {
         match self {
             DeviceView::Die => "Die",
             DeviceView::Package => "Package",
+            DeviceView::Implemented => "Implemented",
         }
     }
 
@@ -179,6 +182,7 @@ impl DeviceView {
         match self {
             DeviceView::Die => "device-view-die",
             DeviceView::Package => "device-view-package",
+            DeviceView::Implemented => "device-view-impl",
         }
     }
 }
@@ -434,6 +438,7 @@ fn device_toolbar(s: &AppState, t: &VivadoTheme) -> El {
     }
     bar.child(view_toggle(DeviceView::Die, s, t))
         .child(view_toggle(DeviceView::Package, s, t))
+        .child(view_toggle(DeviceView::Implemented, s, t))
         .child(el().grow(1.0))
         .child(
             el().key("device-find-toggle")
@@ -1296,6 +1301,7 @@ pub fn device_pane(s: &AppState, t: &VivadoTheme) -> El {
                 .padding(6.0)
                 .child(package_pane(s, t))
                 .child(right),
+            DeviceView::Implemented => crate::views::device_family::implemented_body(s, t),
         })
         .child(bottom_panel(s, t))
         .child(device_status(s, t, &geom, live.as_deref(), placed.as_deref()))

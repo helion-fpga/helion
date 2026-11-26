@@ -294,6 +294,12 @@ impl Router {
         &self.rel_edges[kind_idx][rel_idx].dst
     }
 
+    /// Destination wire of every routing edge a tile of `kind` has (one
+    /// entry per edge, so a wire with several sources repeats).
+    pub fn tile_edge_dsts(&self, kind: TileKind) -> impl Iterator<Item = &str> {
+        self.rel_edges[kind_idx(kind)].iter().map(|e| e.dst.as_str())
+    }
+
     /// Canonical node id of the `glb_netwk_N` wire.
     pub fn glb_node(&self, n: u8) -> NodeId {
         self.glb_base + u32::from(n)

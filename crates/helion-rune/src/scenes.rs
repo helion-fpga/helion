@@ -1861,8 +1861,8 @@ pub const ALL: &[SceneExpect] = &[
     SceneExpect {
         name: "device-ice40",
         surface: "device",
-        keys: &["device", "device-family-badge", "device-family-summary", "device-family-canvas", "device-family-legend", "device-family-placed"],
-        absent: &["device-family-empty", "device-canvas"],
+        keys: &["device", "device-family-badge", "device-family-summary", "device-family-canvas", "device-view-layers", "device-view-heat-slack", "device-view-heat-power", "device-view-heat-line"],
+        absent: &["device-family-empty", "device-canvas", "device-family-legend"],
     },
     SceneExpect {
         name: "timing-ice40",
@@ -1899,6 +1899,18 @@ pub const ALL: &[SceneExpect] = &[
         surface: "reports",
         keys: &["reports-pane", "reports-nav-impl-view"],
         absent: &[],
+    },
+    SceneExpect {
+        name: "device-ecp5",
+        surface: "device",
+        keys: &["device", "device-family-badge", "device-family-canvas", "device-view-layers", "device-view-heat-util", "device-view-region-UL", "device-view-region-LR"],
+        absent: &["device-family-empty", "device-canvas", "device-family-legend"],
+    },
+    SceneExpect {
+        name: "device-hl10-impl",
+        surface: "device",
+        keys: &["device", "device-toolbar", "device-view-die", "device-view-impl", "device-family-badge", "device-family-canvas", "device-view-layers", "device-view-heat-cong-v"],
+        absent: &["device-impl-empty", "device-canvas"],
     },
     SceneExpect {
         name: "hls-fir-cosim",

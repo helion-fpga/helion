@@ -1106,6 +1106,14 @@ pub fn report_timing_routed_with_model(
     Ok(r)
 }
 
+/// The per-endpoint analysis behind [`report_timing_routed`]: the same
+/// model, period and pad delay. `None` when the design was not routed from
+/// its full connection list (or has no clock).
+pub fn graph_timing_routed(design: &Design, routed: &Routed, clocks: &[Clock]) -> Option<graph::GraphTiming> {
+    let tm = TimingModel::hl10t();
+    graph::analyze_with_pad(routed, &tm, clocks.first()?.period_ps as i64, iob_pad_ps(design, &tm))
+}
+
 /// UG903 `set_propagated_clock`: fabric hop delay from the clock IOB row to each FF CLK pin.
 /// Ideal clocks keep this at 0 in the WNS math; the value is always measured from place.
 pub fn clock_network_delay_ps(placed: &Placed) -> i64 {

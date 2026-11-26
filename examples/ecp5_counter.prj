@@ -1,0 +1,4 @@
+# Helion project: the 4-bit counter on an LFE5U-85F (CABGA381)
+part LFE5U-85F
+read_sv examples/counter.sv
+read_xdc examples/ecp5_counter.xdc

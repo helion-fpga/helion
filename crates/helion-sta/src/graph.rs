@@ -26,6 +26,19 @@ pub struct GraphTiming {
     pub tns_ps: i64,
     /// The slowest path, start to end: (what, arrival in ps).
     pub worst_path: Vec<(String, i64)>,
+    /// Every endpoint analysed: its cell, the arrival it must meet the
+    /// period with (setup or pad delay included) and its site's tile.
+    pub endpoint_arrivals: Vec<EndpointArrival>,
+}
+
+/// One analysed endpoint: a flop data input or an output pad.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndpointArrival {
+    /// Flop cell, or the pad's IOB cell.
+    pub cell: String,
+    pub arrival_ps: i64,
+    pub x: u32,
+    pub y: u32,
 }
 
 /// [`analyze`] with the HL10T delay model.
@@ -144,6 +157,7 @@ pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_p
         if has_ff(i) {
             let t = a + tm.setup_ps;
             out.reg_ps = out.reg_ps.max(t);
+            out.endpoint_arrivals.push(EndpointArrival { cell: packed.lutffs[i].ff_cell.clone(), arrival_ps: t, x: site(i).0.x, y: site(i).0.y });
             note(t, format!("{} (setup)", packed.lutffs[i].ff_cell), NetSrc::BleO(i as u32), &mut out, &mut worst);
         }
     }
@@ -163,6 +177,7 @@ pub fn analyze_with_pad(routed: &Routed, tm: &TimingModel, period_ps: i64, pad_p
         };
         let t = a + hops * tm.hop_ps + pad_ps;
         out.out_ps = out.out_ps.max(t);
+        out.endpoint_arrivals.push(EndpointArrival { cell: io.cell.clone(), arrival_ps: t, x: pad.x, y: pad.y });
         note(t, format!("pad {}", io.cell), src, &mut out, &mut worst);
     }
     // Trace the slowest path back to its start.

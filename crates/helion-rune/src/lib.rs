@@ -810,8 +810,11 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         let _ = runs_family::seed_family_fixture(s, "ice40-hx8k");
     }),
     ("device-ice40", |s| {
+        // The iCE40 run's view contract: routing on, slack heat map.
         s.center = state::CenterPane::Device;
         let _ = runs_family::seed_family_fixture(s, "ice40-hx8k");
+        s.device.layers.nets = true;
+        s.device.view_heat = Some(views::contract_views::HeatMap::Slack);
     }),
     ("timing-ice40", |s| {
         s.center = state::CenterPane::Timing;
@@ -850,6 +853,25 @@ pub const SCENES: &[(&str, fn(&mut AppState))] = &[
         s.center = state::CenterPane::Reports;
         let _ = runs_family::seed_xilinx7_view_fixture(s);
         s.reports_view.selected = views::reports::ReportNav::ImplView;
+    }),
+    ("device-ecp5", |s| {
+        // Real ECP5 implementation of examples/counter.sv from its view
+        // contract: clock quadrants, routing and the utilization heat map.
+        s.center = state::CenterPane::Device;
+        let _ = runs_family::seed_family_fixture(s, "LFE5U-85F");
+        s.device.layers.nets = true;
+        s.device.layers.clk = true;
+        s.device.view_heat = Some(views::contract_views::HeatMap::Utilization);
+    }),
+    ("device-hl10-impl", |s| {
+        // Real HL10 implementation of examples/board_counter.sv on the
+        // Device pane's Implemented tab: the contract view beside the HAD
+        // canvas, routing on, vertical congestion.
+        s.center = state::CenterPane::Device;
+        let _ = runs_family::seed_hl10_view_fixture(s);
+        s.device.view = views::device::DeviceView::Implemented;
+        s.device.layers.nets = true;
+        s.device.view_heat = Some(views::contract_views::HeatMap::CongestionV);
     }),
     ("hls-fir-cosim", |s| {
         // The FIR MAC kernel that used to read back 0 in co-simulation.
