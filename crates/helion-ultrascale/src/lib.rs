@@ -23,6 +23,7 @@ pub mod device;
 pub mod device_file;
 pub mod device_grid;
 pub mod dsp;
+pub mod dsp_fuzz;
 pub mod fabric;
 pub mod fasm_gen;
 pub mod grid;

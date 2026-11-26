@@ -24,10 +24,11 @@
 //! - A consecutive pair in different tiles is a span-wire continuation
 //!   (BEG in one tile to END in the tile the tileconn-stitched distance
 //!   away: LEN steps for vertical spans, (LEN + 1) / 2 for horizontal
-//!   spans), not a PIP:
+//!   spans) or a tileconn stitch (an INT_INTF wire to the INT wire
+//!   tileconn names as the same node), not a PIP:
 //!   it emits nothing and is counted in `continuations`. A cross-tile
-//!   pair that does not fit the continuation naming rule fails loud
-//!   instead of being silently skipped.
+//!   pair that fits neither rule fails loud instead of being silently
+//!   skipped.
 //! - A same-tile pair that is an edge in both directions is one of the
 //!   4 bidirectional PIPs (no directional PIP pair exists in both
 //!   directions in the INT tile: verified over all 3,774 PIPs). The
@@ -43,7 +44,9 @@ use crate::router::UltraRouted;
 use std::fmt;
 
 /// A translated route: the INT PIPs it programs, in route order, plus
-/// the number of span-wire continuations crossed (which program no PIP).
+/// the number of PIP-free crossings (which program no PIP): span-wire
+/// continuations and tileconn stitches (INT_INTF to INT). Both are
+/// same-node crossings between tiles; only the PIP list programs bits.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TranslatedRoute {
     pub pips: Vec<IntPip>,
@@ -66,8 +69,9 @@ pub enum RouteToPipError {
         design: String,
     },
     /// A cross-tile pair does not fit the span-wire continuation rule
-    /// (BEG in one tile to its END partner LEN steps away). It is
-    /// neither a PIP nor a continuation.
+    /// (BEG in one tile to its END partner LEN steps away) and is not
+    /// a tileconn stitch. It is neither a PIP, a continuation, nor a
+    /// stitch.
     NotAContinuation {
         src: String,
         dst: String,
@@ -102,7 +106,7 @@ impl fmt::Display for RouteToPipError {
             Self::NotAContinuation { src, dst, design } => write!(
                 f,
                 "route in design '{}' crosses tiles from '{}' to '{}', \
-                 which is neither a PIP nor a span-wire continuation",
+                 which is neither a PIP, a span-wire continuation, nor a tileconn stitch",
                 design, src, dst
             ),
             Self::AmbiguousBidirectionalPip {
@@ -307,7 +311,8 @@ pub fn translate_route_with(
                     .push(IntPip::new(info_a.tile, info_a.name, info_b.name));
             }
         } else {
-            // Cross-tile: must be a span-wire continuation.
+            // Cross-tile: must be a span-wire continuation or a
+            // tileconn stitch (INT_INTF to INT, same node, no PIP).
             let (xa, ya) = db.wire_xy(a);
             let (xb, yb) = db.wire_xy(b);
             let is_continuation = match continuation_partner(info_a.name) {
@@ -316,7 +321,7 @@ pub fn translate_route_with(
                 }
                 None => false,
             };
-            if is_continuation {
+            if is_continuation || db.is_stitch(a, b) {
                 out.continuations += 1;
             } else {
                 return Err(RouteToPipError::NotAContinuation {

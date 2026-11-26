@@ -213,6 +213,39 @@ public prjuray-db tilegrid by
 `tools/verify_xczu3eg.py --write-int-columns` (see README.md for
 the derivation and the 5,940-of-5,940 verification).
 
+## Vivado black-box fuzz (new provenance class)
+
+`vivado_fuzz_xcku3p.tsv`. **This file is a different provenance class from
+everything above and must not be pushed to the public remote until the
+project owner approves the class.**
+
+- Method: black-box fuzzing. A base design is synthesised and implemented,
+  then one primitive attribute is changed per run, the design re-implemented,
+  and the resulting `.bit` diffed against the base. This is the same
+  black-box method prjxray and prjuray used to build their CC0 databases:
+  no Vivado binary is inspected or redistributed, and no internal symbol,
+  address or reverse-engineered text is used. The only decoding is of the
+  documented bitstream frame layout (UG570), which prjxray also documents
+  publicly. Only the resulting bit positions are recorded, which is the
+  same class of fact the CC0 databases publish.
+- Tool: Vivado 2017.3, debug bitstreams (`BITSTREAM.GENERAL.DEBUGBITSTREAM
+  YES`), diffed with `tools/vivado-extract/py/bitframes.py`.
+- Part: xcku3p-ffva676-1-e. Target instance DSP48E2_X0Y44, tile DSP_X3Y110.
+- Raw `.bit`, `.ll` and `.dcp` inputs stay OUT of this repo (23 MB per
+  bitstream, and they are AMD tool output rather than new data).
+- Independent check: every recorded row was re-derived from the base and
+  variant bitstreams and compared against the stored diff. 49 of 49 DSP
+  variant bitstreams matched exactly, 0 mismatches, with the frame ECC
+  words (45 and 46) excluded from the comparison. The only facts this file
+  adds are bit positions and their polarity.
+
+Xilinx/AMD's terms for Vivado output, and the standing practice in the
+prjxray/prjuray projects that published the same class of fact under CC0,
+both treat a bit position observed from a bitstream as unprotectable
+factual information rather than an expression of the tool. The owner's
+approval gate exists because that reading is a judgement call, not because
+the method touches anything proprietary.
+
 ## Helion-derived segbits (not upstream data)
 
 The files in this section are derived by Helion from the public
@@ -231,8 +264,9 @@ holds the full evidence.
 - RapidWright `.dat` files: REJECTED (Xilinx EULA). Never ingested.
 - FPGA Interchange DBs: REJECTED (Xilinx EULA). Never ingested.
 - DSP48E2 config-bit encoding: MISSING in both public sources
-  (site_type_DSP48E2.json documents pins only). Fuzzing plan is in the
-  day-1 report; DSP48E2 lookups fail loud until it lands.
+  (site_type_DSP48E2.json documents pins only). PARTIALLY SUPPLIED by
+  `vivado_fuzz_xcku3p.tsv` for the attributes it lists; every attribute
+  not listed there still fails loud.
 - URAM288: MISSING in both public sources. Fail loud until it lands.
 - BUFGCE / BUFGCTRL / BUFGCE_DIV / MMCM / PLL site config-bit encoding:
   MISSING in every public source checked 2026-11-19. Zero lines in

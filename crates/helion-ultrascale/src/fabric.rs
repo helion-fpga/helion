@@ -57,6 +57,15 @@ pub trait WireDb: Send + Sync {
     /// Wire name and tile name for the router-to-PIP translator.
     /// `None` when this database cannot name wires (placeholder, mock).
     fn wire_info(&self, wire: WireId) -> Option<WireInfo<'_>>;
+    /// True when the pair is a tileconn stitch: two wires in different
+    /// tiles that tileconn names as the same electrical node, so the
+    /// translator programs no PIP for the crossing. Default false:
+    /// placeholder and mock graphs have no stitches, and INT-only
+    /// graphs never add any. The translator consults this for
+    /// cross-tile pairs that are not span continuations.
+    fn is_stitch(&self, _a: WireId, _b: WireId) -> bool {
+        false
+    }
 }
 
 /// Timing database seam. The timing agent provides the implementation.
