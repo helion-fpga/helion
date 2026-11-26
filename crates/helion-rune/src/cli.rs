@@ -15,6 +15,8 @@ pub fn usage() -> String {
   {BIN}                          open the IDE (Start page, recent projects)
   {BIN} <project.prj|file.sv>    open the IDE on a project or source
   {BIN} --headless <file>        synthesize, place, route and report timing; prints WNS_PS
+  {BIN} --headless <top.sv> --part <7-series part>
+                                 same on a lone source; constraints from <top>.xdc next to it
   {BIN} --source <script.tcl>    run a Tcl script in batch mode (exit 1 on the first error)
   {BIN} --stdin                  Tcl console on stdin, one command per line (`quit` ends)
   {BIN} --version                version line
@@ -45,7 +47,10 @@ pub fn run(args: &[String]) -> Option<i32> {
             0
         }
         Some("--headless") => match args.get(1) {
-            Some(path) => headless(Path::new(path)),
+            Some(path) => {
+                let part = args.iter().position(|a| a == "--part").and_then(|i| args.get(i + 1));
+                headless(Path::new(path), part.map(String::as_str))
+            }
             None => stdin_console(),
         },
         Some("--stdin") => stdin_console(),
@@ -86,8 +91,8 @@ fn open(s: &mut crate::AppState, path: &Path) -> Result<String, String> {
 }
 
 /// `--headless <file>`: the full flow plus timing, as one command.
-fn headless(path: &Path) -> i32 {
-    if let Some(code) = headless_xilinx7(path) {
+fn headless(path: &Path, part: Option<&str>) -> i32 {
+    if let Some(code) = headless_xilinx7(path, part) {
         return code;
     }
     let mut s = state();
@@ -116,19 +121,21 @@ fn headless(path: &Path) -> i32 {
     }
 }
 
-/// A `.prj` on a 7-series part runs the XDC flow and prints the view
-/// contract's reports, device layers, heat maps and usage line. `None` for
-/// any other source (the Tcl path handles it).
-fn headless_xilinx7(path: &Path) -> Option<i32> {
-    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
-        return None;
-    }
-    let prj = helion_proj::load_prj(&std::fs::read_to_string(path).ok()?).ok()?;
-    if !crate::runs_family::is_xilinx7(&prj.part) {
+/// A `.prj` on a 7-series part, or a lone HDL source with `--part` naming a
+/// 7-series part (its `<stem>.xdc` beside it), runs the XDC flow and prints
+/// the view contract's reports, device layers, heat maps and usage line.
+/// `None` for any other source (the Tcl path handles it).
+fn headless_xilinx7(path: &Path, part: Option<&str>) -> Option<i32> {
+    let part = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
+        helion_proj::load_prj(&std::fs::read_to_string(path).ok()?).ok()?.part
+    } else {
+        part?.to_string()
+    };
+    if !crate::runs_family::is_xilinx7(&part) {
         return None;
     }
     let out = std::env::temp_dir().join(format!("helion-ide-headless-{}", std::process::id()));
-    let art = crate::runs_family::run_xdc_flow(path, &prj.part, &out, &|l, _| eprintln!("{l}"));
+    let art = crate::runs_family::run_xdc_flow(path, &part, &out, &|l, _| eprintln!("{l}"));
     let _ = std::fs::remove_dir_all(&out);
     Some(match art.map(|a| a.view) {
         Ok(Some(v)) => {

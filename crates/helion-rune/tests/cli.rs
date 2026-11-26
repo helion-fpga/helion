@@ -51,6 +51,30 @@ fn headless_counter_is_the_release_gold() {
     }
 }
 
+/// A lone source plus its sibling `.xdc` on a 7-series part runs the same
+/// XDC flow as a `.prj` and prints the view contract's reports.
+#[test]
+fn headless_lone_sv_with_xdc_on_a_7series_part() {
+    let db = std::env::var_os("HELION_XILINX_DB")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/helion/prjxray-db")));
+    if !db.is_some_and(|d| d.join("zynq7").is_dir()) {
+        eprintln!("skipped: no Project X-Ray zynq7 database (set HELION_XILINX_DB)");
+        return;
+    }
+    let out = Command::new(bin())
+        .args(["--headless"])
+        .arg(example("zedboard_oled_demo.sv"))
+        .args(["--part", "xc7z020clg484-1"])
+        .output()
+        .unwrap();
+    let s = stdout(&out);
+    assert!(out.status.success(), "{s}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(s.starts_with("Xilinx 7-Series xc7z020clg484-1 Routed"), "{s}");
+    assert!(s.contains("Slice LUTs") && s.contains("WHS (ns)"), "{s}");
+    assert!(s.lines().any(|l| l.starts_with("WNS_PS=")), "{s}");
+}
+
 #[test]
 fn headless_missing_file_fails() {
     let out = Command::new(bin())
