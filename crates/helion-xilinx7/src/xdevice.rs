@@ -106,18 +106,42 @@ const PIP_BASE: u32 = 15;
 // greedy and extended whichever tree wire lay nearest the load, so
 // the loads of a chip-wide net were reached one after another (G38).
 const EST_TILE_PS: u32 = 30;
+// Past the lookahead's reach a route rides long lines: LH12 crosses about 28
+// grid columns and LV18 18 rows for one 301 ps pip (+ PIP_BASE), 11.3
+// and 17.6 ps per tile. Charging 30 there overestimated a long hop 2-3x, and
+// the search (each wire expanded once) settled on a hex chain about 50%
+// slower than the long-line route (G95).
+// Only for nets near the critical path: on a chip-wide non-critical net
+// (Ibex's reset, 931 loads) the honest estimate let far tree seeds compete
+// with near ones and the search expanded 4.5x the wires, for no timing gain.
+const FAR_X_PS: u32 = 11;
+const FAR_Y_PS: u32 = 17;
+/// Criticality (`RouteOpts::crit`) from which a net's searches use the long-line rates.
+const LONG_LINE_CRIT: u8 = 64;
+
+/// Estimated cost of the part of an offset past the lookahead's reach, at
+/// long-line rates (`long`) or `EST_TILE_PS`.
+fn far_ps(dx: i32, dy: i32, long: bool) -> u32 {
+    let (rx, ry) = if long { (FAR_X_PS, FAR_Y_PS) } else { (EST_TILE_PS, EST_TILE_PS) };
+    rx * (dx.abs() - LA_R).max(0) as u32 + ry * (dy.abs() - LA_R).max(0) as u32
+}
+
+/// Flat estimate for an offset: `EST_TILE_PS` within the reach, [`far_ps`] past it.
+fn flat_ps(dx: i32, dy: i32, long: bool) -> u32 {
+    EST_TILE_PS * (dx.abs().min(LA_R) + dy.abs().min(LA_R)) as u32 + far_ps(dx, dy, long)
+}
 
 impl Lookahead {
     /// Estimated cost from wire `wi` of a tile of type `ty` to a pin of a
     /// `kind` tile `(dx, dy)` grid tiles away.
-    fn est(&self, kind: usize, ty: u32, wi: u32, dx: i32, dy: i32) -> Option<u32> {
+    fn est(&self, kind: usize, ty: u32, wi: u32, dx: i32, dy: i32, long: bool) -> Option<u32> {
         let c = *self.cls.get(ty as usize)?.get(wi as usize)?;
         if c == u32::MAX {
             return None;
         }
         let (cx, cy) = ((dx.clamp(-LA_R, LA_R) + LA_R) as usize, (dy.clamp(-LA_R, LA_R) + LA_R) as usize);
         let v = self.table[((c as usize * LA_KINDS.len() + kind) * LA_S + cy) * LA_S + cx];
-        (v != u16::MAX).then(|| v as u32 + EST_TILE_PS * ((dx.abs() - LA_R).max(0) + (dy.abs() - LA_R).max(0)) as u32)
+        (v != u16::MAX).then(|| v as u32 + far_ps(dx, dy, long))
     }
 }
 
@@ -583,6 +607,7 @@ impl<'a> XDevice<'a> {
             .iter()
             .map(|&t| la.and_then(|_| self.device.tile_type_name(self.wire_to_tile[t as usize].0)).and_then(|n| LA_KINDS.iter().position(|k| *k == n)))
             .collect();
+        let long = opts.crit >= LONG_LINE_CRIT;
         let h = |id: u32| -> u32 {
             let (ti, wi) = self.wire_to_tile[id as usize];
             let Some(t) = self.device.tile(ti) else { return 0 };
@@ -591,14 +616,15 @@ impl<'a> XDevice<'a> {
                 .iter()
                 .zip(&tgt_kind)
                 .map(|(&(tx, ty), k)| {
-                    let d = ((x - tx).abs() + (y - ty).abs()) as u32;
                     // Negotiating adds penalties near the sinks; a steeper
                     // estimate keeps that search aimed at them instead of flooding
-                    // everything within the penalty's reach.
-                    if opts.negotiate {
-                        return d * 220;
+                    // everything within the penalty's reach. Not for a critical
+                    // net: at 220 ps per tile the search was near greedy and took a
+                    // 10.3 ns chain of single hops around taken hexes (G95).
+                    if opts.negotiate && !long {
+                        return ((x - tx).abs() + (y - ty).abs()) as u32 * 220;
                     }
-                    k.and_then(|k| la?.est(k, t.type_id, wi, tx - x, ty - y)).unwrap_or(d * EST_TILE_PS)
+                    k.and_then(|k| la?.est(k, t.type_id, wi, tx - x, ty - y, long)).unwrap_or_else(|| flat_ps(tx - x, ty - y, long))
                 })
                 .min()
                 .unwrap_or(0)
@@ -783,7 +809,7 @@ impl<'a> XDevice<'a> {
         LAST_EXPANDED.with(|e| e.set(expanded));
         if debug_env("HELION_ROUTE_STATS") {
             let (cost, dist) = match found {
-                Some(e) => (sb.best[e as usize], h(start) / if opts.negotiate { 220 } else { 90 }),
+                Some(e) => (sb.best[e as usize], h(start) / EST_TILE_PS),
                 None => (0, 0),
             };
             eprintln!("route_stat net={net} expanded={expanded} found={} negotiate={} bbox={} cost={cost} dist={dist}", found.is_some(), opts.negotiate, opts.bbox);
@@ -2256,6 +2282,30 @@ mod tests {
         }
         x.pf_present(None);
         assert!(la_e * 2 < flat_e, "expanded {la_e} with the lookahead, {flat_e} flat");
+    }
+
+    /// G95: a long hop rides long lines. Past the lookahead's reach the
+    /// estimate charged 30 ps per tile, two to three times a long line's
+    /// rate, and both searches settled on hex chains: 2988-3017 ps for the
+    /// bram_fill hop and 2160-2576 ps for the dsp_fill_prims one, where
+    /// the cheapest paths (Dijkstra) are 1986 and 1962 ps.
+    #[test]
+    fn long_hops_take_long_lines() {
+        let (dev, maps) = test_z020();
+        let x = XDevice::new(dev, maps.clone());
+        let claimed = HashMap::new();
+        for (from, fp, to, tp) in [("SLICE_X50Y53", "D", "SLICE_X108Y25", "BX"), ("SLICE_X94Y129", "AQ", "SLICE_X95Y61", "D1")] {
+            let src = x.site_pin_wire(from, fp).expect("src");
+            let dst = x.site_pin_wire(to, tp).expect("dst");
+            for pf in [false, true] {
+                x.pf_present(pf.then_some(200));
+                let opts = crate::route::RouteOpts { allow_byp: tp.ends_with('X'), crit: 255, ..Default::default() };
+                let (_, arr) = x.astar((&src.0, &src.1), &[], &[dst.clone()], opts, "probe", &claimed).flatten().expect("routes");
+                let d = arr.last().map(|a| a.1).unwrap_or(0);
+                assert!(d <= 2100, "{from} -> {to} (lookahead {pf}): {d} ps");
+            }
+        }
+        x.pf_present(None);
     }
 
     /// G76 probe: the fastest route the search finds for one long hop on an

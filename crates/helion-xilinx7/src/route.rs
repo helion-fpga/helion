@@ -275,7 +275,7 @@ fn pf_margin(fails: u32, open: u32, cap: i32) -> i32 {
 /// and then anywhere; the caller rips up the displaced nets. In PathFinder
 /// every signal wire but a clock net's may be shared: a search is the
 /// cheapest path at current prices in the net's box (the detour cap and the
-/// steep negotiating estimate let it run straight through congestion
+/// negotiating search let it run straight through congestion
 /// instead, G77). A box walled off by clock wires falls back to the same
 /// exact search over the whole device, which is not capped (each wire is
 /// expanded at most once), so it fails only when no path exists; the
