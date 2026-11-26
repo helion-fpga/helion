@@ -2320,6 +2320,12 @@ impl Elab {
                     let msb = self.dag.slice(*n, nw - 1, 1);
                     let lo = self.dag.slice(*n, 0, w - 1);
                     self.dag.concat(vec![msb, lo])
+                } else if let (true, &Op::Mul(a, b)) = (w > nw, self.dag.op(*n)) {
+                    // A widened product is the product of widened operands
+                    // (numeric_std `*` is exact), so a DSP's P register
+                    // takes `p <= resize(a * b, w)` whole.
+                    let (a, b) = (self.dag.ext(a, w, signed), self.dag.ext(b, w, signed));
+                    self.dag.mul(a, b)
                 } else {
                     let e = self.dag.ext(*n, nw.max(w), signed);
                     self.dag.slice(e, 0, w)
