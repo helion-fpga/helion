@@ -87,6 +87,9 @@ fn open(s: &mut crate::AppState, path: &Path) -> Result<String, String> {
 
 /// `--headless <file>`: the full flow plus timing, as one command.
 fn headless(path: &Path) -> i32 {
+    if let Some(code) = headless_xilinx7(path) {
+        return code;
+    }
     let mut s = state();
     if let Err(e) = open(&mut s, path) {
         eprintln!("{BIN}: {e}");
@@ -111,6 +114,45 @@ fn headless(path: &Path) -> i32 {
             1
         }
     }
+}
+
+/// A `.prj` on a 7-series part runs the XDC flow and prints the view
+/// contract's reports, device layers, heat maps and usage line. `None` for
+/// any other source (the Tcl path handles it).
+fn headless_xilinx7(path: &Path) -> Option<i32> {
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("prj")) {
+        return None;
+    }
+    let prj = helion_proj::load_prj(&std::fs::read_to_string(path).ok()?).ok()?;
+    if !crate::runs_family::is_xilinx7(&prj.part) {
+        return None;
+    }
+    let out = std::env::temp_dir().join(format!("helion-ide-headless-{}", std::process::id()));
+    let art = crate::runs_family::run_xdc_flow(path, &prj.part, &out, &|l, _| eprintln!("{l}"));
+    let _ = std::fs::remove_dir_all(&out);
+    Some(match art.map(|a| a.view) {
+        Ok(Some(v)) => {
+            use crate::views::contract_views as cv;
+            print!("{}", cv::render_all_reports(&v));
+            print!("{}", cv::render_device_tab(&v));
+            println!("{}", cv::usage_summary(&v));
+            match &v.timing {
+                Some(t) => {
+                    println!("WNS_PS={}", t.wns_ps);
+                    0
+                }
+                None => 1,
+            }
+        }
+        Ok(None) => {
+            eprintln!("{BIN}: the run produced no implementation view");
+            1
+        }
+        Err(e) => {
+            eprintln!("{BIN}: {e}");
+            1
+        }
+    })
 }
 
 /// `--source <script.tcl>`: Vivado-style batch mode.

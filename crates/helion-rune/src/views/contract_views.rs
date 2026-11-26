@@ -371,7 +371,7 @@ fn methodology(view: &ImplView) -> Panel {
             "pass"
         },
         &format!(
-            "{} nets at or above the threshold, largest {} loads",
+            "{} highest-fanout nets listed, largest {} loads",
             view.high_fanout.len(),
             max_fanout
         ),
@@ -653,20 +653,24 @@ fn slack_heat(view: &ImplView) -> Vec<HotTile> {
     if req == 0 {
         return Vec::new();
     }
-    let mut out = Vec::new();
+    // One value per tile: the worst endpoint slack in it.
+    let mut worst: BTreeMap<(u32, u32), i64> = BTreeMap::new();
     for e in &t.endpoints {
         let (Some(x), Some(y)) = (e.x, e.y) else {
             continue;
         };
-        let used = (req - e.slack_ps).max(0) as f32;
-        out.push(HotTile {
+        let w = worst.entry((x, y)).or_insert(e.slack_ps);
+        *w = (*w).min(e.slack_ps);
+    }
+    worst
+        .into_iter()
+        .map(|((x, y), slack)| HotTile {
             x,
             y,
-            value: 100.0 * used / req as f32,
-            overused: e.slack_ps < 0,
-        });
-    }
-    out
+            value: 100.0 * (req - slack).max(0) as f32 / req as f32,
+            overused: slack < 0,
+        })
+        .collect()
 }
 
 fn power_heat(view: &ImplView) -> Vec<HotTile> {
