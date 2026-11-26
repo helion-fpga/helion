@@ -24,9 +24,16 @@ R5 leaves fed from the neighbouring HCLK tile: the row clock's buffer sits in
    the tile it enters. An HCLK_L leaf from HCLK_CK_OUTIN_Ln takes BUFHCLKn
    through the HCLK_R tile beside it (HCLK_CK_INOUT_Rn, a pip without bits),
    so that HCLK_R tile needs ENABLE_BUFFER.HCLK_CK_BUFHCLKn; an HCLK_R leaf
-   from HCLK_CK_OUTIN_Rn (n = 0..3) needs ENABLE_BUFFER.HCLK_CK_BUFHCLK(8+n)
-   in the HCLK_L tile beside it. Without it the columns have no clock (the
-   2026-11-18 ZedBoard fault, HELION_GAPS.md G69/G73).
+   from HCLK_CK_OUTIN_Rn (n = 4..7, stitched to HCLK_CK_INOUT_L(n-4)) needs
+   ENABLE_BUFFER.HCLK_CK_BUFHCLK(n+4) in the HCLK_L tile beside it. Without
+   it the columns have no clock (the 2026-11-18 ZedBoard fault,
+   HELION_GAPS.md G69/G73).
+R6 no leaf through the neighbouring HCLK tile at all: Vivado drives a tile's
+   leaves from the tile's own buffer in every reference build, and on the
+   XC7S25 the columns clocked through the link ran no block RAM or flop on
+   silicon although R5 held (Arty S7-25, 2026-11-26). The link did run on
+   the ZedBoard with R5's enable, so this is "not proven for the part", and
+   it is an error because a dead clock passes every other check.
 """
 from __future__ import annotations
 
@@ -149,9 +156,13 @@ def check(db: Db, dec: DesignDecode) -> ClockReport:
             continue
         side, other, dx = ("L", "HCLK_R", 1) if ty == "HCLK_L" else ("R", "HCLK_L", -1)
         for n in sorted({int(m.group(1)) for f in fs if (m := re.match(rf"^HCLK_LEAF_CLK_B_\w+\.HCLK_CK_OUTIN_{side}(\d+)$", f))}):
-            buf = n if side == "L" else 8 + n
-            if buf > 11:
-                continue  # regional (BUFR) clocks: no buffer-enable feature
+            rep.errors.append(f"R6 {t}: leaf from HCLK_CK_OUTIN_{side}{n}, the link to the neighbouring HCLK tile, "
+                              "which Vivado never uses and which left these columns unclocked on the XC7S25")
+            # HCLK_CK_OUTIN_Ln is HCLK_CK_INOUT_Rn (BUFHCLKn); HCLK_CK_OUTIN_Rn
+            # is HCLK_CK_INOUT_L(n-4) (BUFHCLK(n+4)) for n = 4..7.
+            buf = n if side == "L" else n + 4
+            if buf > 11 or (side == "R" and n < 4):
+                continue  # regional (BUFR) clocks: R5 has no rule for them
             nb = hclk_at.get((tg[t]["grid_x"] + dx, tg[t]["grid_y"]))
             if nb is None or tg[nb]["type"] != other:
                 rep.errors.append(f"R5 {t}: leaf from HCLK_CK_OUTIN_{side}{n} but no {other} tile beside it")

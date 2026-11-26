@@ -47,6 +47,11 @@ pub struct RouteOpts {
     /// path). A critical net pays less for congested wires, so it keeps a
     /// short route and the less critical net moves (G71).
     pub crit: u8,
+    /// A clock may reach an HCLK tile's leaves through the neighbouring
+    /// tile's buffer (`HCLK_CK_INOUT_*` to `HCLK_CK_OUTIN_*`). Off by
+    /// default: Vivado drives a tile's leaves from the tile's own buffer,
+    /// and on the XC7S25 the columns clocked through the link do not run.
+    pub hclk_link: bool,
 }
 
 /// What the router needs from the device model.
