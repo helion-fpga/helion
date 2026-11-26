@@ -21,6 +21,8 @@
 //!   the IDE and `zedbit` write the same `.bit`.
 
 pub mod reports;
+pub mod view;
+pub mod view_xilinx7;
 
 use helion_backend::Backend;
 use helion_ir::Design;

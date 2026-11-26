@@ -14,6 +14,7 @@ pub mod dfx;
 pub mod device_floor;
 pub mod device_io;
 pub mod device_io_quick;
+pub mod contract_views;
 pub mod device_layers;
 pub mod device_package;
 pub mod dialogs;
