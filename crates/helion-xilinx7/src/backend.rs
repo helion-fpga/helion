@@ -56,6 +56,11 @@ impl Xilinx7Backend {
         &self.device
     }
 
+    /// The part this backend was opened for.
+    pub fn part(&self) -> &str {
+        &self.part
+    }
+
     /// Build the per-stage [`XDevice`] query adapter, registering the packed
     /// BUFG outputs as clock nets so the router uses the dedicated spine.
     fn xdevice(&self, bufgs: &[crate::pack::PackedBufg]) -> XDevice<'_> {

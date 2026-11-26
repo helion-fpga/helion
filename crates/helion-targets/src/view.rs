@@ -269,14 +269,15 @@ pub struct TimingPath {
 /// Timing summary, computed for this run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimingSummary {
-    /// Worst negative slack, ps (0 when nothing violates).
+    /// Worst setup slack, ps; positive when every endpoint meets.
     pub wns_ps: i64,
-    /// Total negative slack, ps.
+    /// Total negative setup slack over all endpoints, ps (0 when none fails).
     pub tns_ps: i64,
-    /// Worst hold slack, ps.
-    pub whs_ps: i64,
-    /// Total hold slack violation, ps.
-    pub ths_ps: i64,
+    /// Worst hold slack, ps. None when the engine has no hold analysis; the
+    /// reason is in [`ImplView::missing`] under `"hold"`.
+    pub whs_ps: Option<i64>,
+    /// Total hold slack violation, ps. None with `whs_ps`.
+    pub ths_ps: Option<i64>,
     /// Number of failing endpoints.
     pub failing_endpoints: usize,
     pub total_endpoints: usize,

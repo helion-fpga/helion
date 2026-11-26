@@ -233,8 +233,12 @@ fn timing_summary(view: &ImplView) -> Panel {
     let mut tbl = Table::new(&["Metric", "Value"]);
     tbl.push(&["WNS (ns)", &fmt_ps(t.wns_ps)]);
     tbl.push(&["TNS (ns)", &fmt_ps(t.tns_ps)]);
-    tbl.push(&["WHS (ns)", &fmt_ps(t.whs_ps)]);
-    tbl.push(&["THS (ns)", &fmt_ps(t.ths_ps)]);
+    let hold_missing = || {
+        let why = view.missing.get("hold").map(String::as_str).unwrap_or("the engine reported no hold analysis");
+        format!("not computed: {why}")
+    };
+    tbl.push(&["WHS (ns)", &t.whs_ps.map(fmt_ps).unwrap_or_else(hold_missing)]);
+    tbl.push(&["THS (ns)", &t.ths_ps.map(fmt_ps).unwrap_or_else(hold_missing)]);
     tbl.push(&[
         "Failing endpoints",
         &format!("{} of {}", t.failing_endpoints, t.total_endpoints),
@@ -326,13 +330,14 @@ fn power(view: &ImplView) -> Panel {
 
 fn drc(view: &ImplView) -> Panel {
     if view.drc.is_empty() {
-        // An empty DRC list is a result (no violations), not missing data, as
-        // long as the run got far enough to check.
-        if view.stage == Stage::Synthesized {
+        // An empty DRC list is a result (no violations) only when rules were
+        // run; the note names them.
+        if view.stage == Stage::Synthesized || view.missing.contains_key("drc") || !view.provenance.contains_key("drc") {
             return missing(view, "drc", Report::Drc.title());
         }
+        let rules = provenance_note(view, "drc").unwrap_or_default();
         return Panel::table(Report::Drc.title(), Table::new(&["Rule", "Severity", "Message"]))
-            .with_note("no violations".to_string());
+            .with_note(format!("no violations; {rules}"));
     }
     let mut tbl = Table::new(&["Rule", "Severity", "Message"]);
     for v in &view.drc {
@@ -1054,8 +1059,8 @@ mod tests {
         v.timing = Some(TimingSummary {
             wns_ps: -150,
             tns_ps: -300,
-            whs_ps: 20,
-            ths_ps: 0,
+            whs_ps: Some(20),
+            ths_ps: Some(0),
             failing_endpoints: 2,
             total_endpoints: 10,
             worst_path: Some(TimingPath {
