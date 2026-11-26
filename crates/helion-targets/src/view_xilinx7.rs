@@ -464,8 +464,9 @@ pub fn fill_resources(view: &mut ImplView, routed: &Routed7, dev: &Device) {
         .collect();
     let b36 = p.brams.iter().filter(|b| b.site.starts_with("RAMB36")).count() as f64;
     let b18 = p.brams.len() as f64 - b36;
-    // X-Ray types a block RAM tile's lower RAMB18 site FIFO18E1, so count tiles.
-    let ramb18_sites = 2 * dev.sites_of_types(&["RAMB36E1"]).len() as u32;
+    // X-Ray types a block RAM tile's sites FIFO18E1, RAMBFIFO36E1 and
+    // RAMB18E1, so count the tiles.
+    let ramb18_sites = 2 * dev.bram36_sites().len() as u32;
     let iob_sites = dev.package_pins().filter(|pp| pp.site.starts_with("IOB_")).count() as u32;
     let iobs: HashSet<&str> = p.iobs.iter().map(|i| i.site.as_str()).collect();
     let bufg = p.bufgs.iter().filter(|g| g.site.starts_with("BUFGCTRL")).count() as f64;

@@ -207,6 +207,11 @@ fn rows_for(d: &RefDesign, v: &Vivado, h: &ImplView) -> Vec<Row> {
     ] {
         let viv = v.util.get(name).and_then(|r| num(&r[0])).unwrap_or(f64::NAN);
         push(name, viv, res(name), tol);
+        // The part's capacity is structural: the same site count as Vivado's.
+        if let Some(avail) = v.util.get(name).and_then(|r| num(&r[2])) {
+            let ours = h.resources.iter().find(|r| r.name == name).map(|r| r.available as f64).unwrap_or(f64::NAN);
+            push(&format!("{name} available"), avail, ours, Tol::Exact);
+        }
     }
     let ns = |k: &str| v.summary.get(k).and_then(|s| num(s)).unwrap_or(f64::NAN);
     let whs_viv = v
