@@ -521,7 +521,7 @@ mod tests {
         let t = v.timing.as_ref().expect("timing");
         assert!(t.total_endpoints >= 27 && t.endpoints.len() == t.total_endpoints, "every endpoint's slack");
         assert!(t.endpoints.iter().all(|e| e.x.is_some()), "endpoints land on the die");
-        assert!(t.whs_ps.is_none() && v.missing.contains_key("hold"), "hold is named missing, not zero");
+        assert!(t.whs_ps.is_some() && t.ths_ps.is_some() && t.worst_hold_path.is_some(), "hold is computed for this run");
         let io = v.io.as_ref().expect("io");
         assert_eq!(io.pins.len(), 9, "clk + 8 LEDs");
         assert!(io.pins.iter().all(|p| p.bank.is_some()), "bank from the package table");
@@ -530,7 +530,10 @@ mod tests {
         assert!(c.clocks[0].loads >= 27 && !c.clocks[0].regions.is_empty() && c.clocks[0].buffer.is_some(), "{:?}", c.clocks[0]);
         assert!(c.bufgs_used >= 1 && c.bufgs_available == 32);
         assert!(!v.control_sets.is_empty() && !v.high_fanout.is_empty());
-        assert!(v.missing.contains_key("power"), "power names its missing input");
+        let p = v.power.as_ref().expect("power estimate");
+        assert!(p.dynamic_mw > 0.0 && p.static_mw > 0.0 && !p.tiles.is_empty() && p.method.contains("fit error"), "{p:?}");
+        assert!(v.resources.iter().any(|r| r.name == "Slice Registers" && r.used >= 27.0), "utilization rows");
+        assert_eq!(v.congestion.len(), 2, "H and V congestion levels");
     }
 
     #[test]
