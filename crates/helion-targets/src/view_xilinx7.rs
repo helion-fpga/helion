@@ -21,6 +21,11 @@
 //! - **Timing**: the run's setup analysis, every endpoint's slack.
 //! - **Clocks, control sets, fanout, IO**: computed from the packed netlist,
 //!   the placement and the router's net pins.
+//! - **Schematic**: the v2 front end's elaborated netlist (RTL), the
+//!   synthesized netlist the packer read, and that netlist with each cell's
+//!   site and BEL from the placement (implemented).
+//! - **Board**: the board's own pin file (`boards/<name>.xdc`) joined to the
+//!   run's IO plan by package pin.
 //!
 //! Nothing here re-runs place or route: it reads the run's result.
 
@@ -36,6 +41,7 @@ use helion_xilinx7::xdc_flow::Built;
 
 use crate::Family;
 use crate::view::{
+    BoardGroup, BoardItem, BoardPanel, NetlistCell, NetlistPin, NetlistStage, SchematicNetlist,
     CellPlacement, ClockNet, ClockUtilization, CongestionWindow, PowerBlock, PowerEstimate, TilePower, ControlSet, DrcViolation, EndpointSlack,
     HighFanoutNet, ImplView, IoPin, IoPlan, Overflow, Provenance, ResourceRow, RoutedNet, Stage, TileClass,
     TileUsage, TimingPath, TimingSummary, ViewTile, WireHop,
@@ -928,8 +934,156 @@ pub fn from_built(b: &Built) -> ImplView {
     );
     let toggle = b.design.attrs.get("DEFAULT_TOGGLE_RATE").and_then(|t| t.trim().trim_end_matches('%').parse::<f64>().ok()).map(|t| if t > 1.0 { t / 100.0 } else { t });
     fill_power(&mut v, &b.routed, &b.periods, toggle);
-    v.mark_missing("board", "the board panel is not built yet: it needs the board's XDC labels joined to the design ports");
+    fill_schematic(&mut v, b.rtl.as_ref(), &b.design);
+    fill_board(&mut v);
     v
+}
+
+/// Xilinx primitive name of a synthesized cell, from its kind and pins.
+pub fn primitive_of(c: &helion_ir::Cell, pins: &[NetlistPin]) -> String {
+    use helion_ir::CellKind as K;
+    let has = |p: &str| pins.iter().any(|x| x.name == p);
+    match &c.kind {
+        K::Lut6 { .. } => format!("LUT{}", pins.iter().filter(|p| !p.output && p.name.starts_with('I')).count().max(1)),
+        K::Hff if has("ARST") => if c.attrs.get("ARST_VAL") == Some("1") { "FDPE" } else { "FDCE" }.into(),
+        K::Hff if has("SR") || has("RST") => if c.attrs.get("SRVAL") == Some("1") { "FDSE" } else { "FDRE" }.into(),
+        K::Hff => "FDRE".into(),
+        K::IobIn => "IBUF".into(),
+        K::IobOut => "OBUF".into(),
+        K::ClockBuf => "BUFG".into(),
+        K::Mac27 | K::Dsp48e1 { .. } => "DSP48E1".into(),
+        K::Bram18 | K::Bram18e1 { .. } => "RAMB18E1".into(),
+        K::Carry4 => "CARRY4".into(),
+        K::Ila { .. } => "ILA".into(),
+        K::BlackBox { module } => helion_ir::resolve(*module).to_string(),
+    }
+}
+
+/// Whether a pin of a Helion IR cell drives its net: the cell's `OUT_PINS`
+/// list when it has one, else the 7-series output pin names.
+// shortcut: name-based for primitives without OUT_PINS; a new primitive with other output names reads as all inputs until it is listed here.
+pub fn is_output_pin(c: &helion_ir::Cell, pin: &str) -> bool {
+    if let Some(outs) = c.attrs.get("OUT_PINS") {
+        return outs.split(',').any(|o| o == pin);
+    }
+    if matches!(c.kind, helion_ir::CellKind::IobOut) {
+        return pin == "PAD";
+    }
+    let base = pin.split('[').next().unwrap_or(pin).trim_end_matches(|ch: char| ch.is_ascii_digit());
+    matches!(base, "O" | "Q" | "CO" | "P" | "PCOUT" | "ACOUT" | "BCOUT" | "CARRYOUT" | "DOADO" | "DOBDO" | "DOPADOP" | "DOPBDOP" | "LOCKED" | "CLKOUT" | "CLKFBOUT")
+}
+
+/// The three schematic netlists: elaborated, synthesized, and synthesized
+/// with the placement's site and BEL on each cell.
+pub fn fill_schematic(view: &mut ImplView, rtl: Option<&Design>, design: &Design) {
+    match rtl {
+        Some(r) => {
+            view.schematic.push(SchematicNetlist::from_ir(r, NetlistStage::Rtl, primitive_of, is_output_pin));
+            view.set_provenance(
+                NetlistStage::Rtl.section(),
+                Provenance::new("helion-sv v2", "elaborated word-level netlist before bit blasting: one cell per operator, register and constant", SCOPE),
+            );
+        }
+        None => view.mark_missing(
+            NetlistStage::Rtl.section(),
+            "the zb front end built this design (the v2 front end refused it); it keeps no elaborated netlist",
+        ),
+    }
+    let syn = SchematicNetlist::from_ir(design, NetlistStage::Synthesized, primitive_of, is_output_pin);
+    view.set_provenance(
+        NetlistStage::Synthesized.section(),
+        Provenance::new("helion-sv v2 lower", "the mapped netlist the packer reads (LUTs, flops, carry chains, IO and clock buffers)", SCOPE),
+    );
+    let mut imp = syn.clone();
+    imp.stage = NetlistStage::Implemented;
+    let at: HashMap<&str, &CellPlacement> = view.cells.iter().map(|c| (c.cell.as_str(), c)).collect();
+    let mut placed = 0usize;
+    for c in imp.cells.iter_mut() {
+        if let Some(p) = at.get(c.name.as_str()) {
+            c.site = Some(p.site.clone());
+            c.bel = p.bel.clone();
+            placed += 1;
+        }
+    }
+    let names: HashSet<&str> = syn.cells.iter().map(|c| c.name.as_str()).collect();
+    let mut added = 0usize;
+    for p in view.cells.iter().filter(|p| !names.contains(p.cell.as_str())) {
+        imp.cells.push(NetlistCell { name: p.cell.clone(), kind: p.kind.clone(), pins: Vec::new(), site: Some(p.site.clone()), bel: p.bel.clone() });
+        added += 1;
+    }
+    view.set_provenance(
+        NetlistStage::Implemented.section(),
+        Provenance::new(
+            "helion-xilinx7 place",
+            format!(
+                "synthesized netlist with the placement's site and BEL: {placed} of {} cells placed under their own name; {added} cells the packer made (buffers, split LUTs) carry a site but no pins",
+                syn.cells.len()
+            ),
+            SCOPE,
+        ),
+    );
+    view.schematic.push(syn);
+    view.schematic.push(imp);
+}
+
+/// Board part kind from the board pin file's port name.
+fn board_kind(port: &str) -> String {
+    let base = port.split('[').next().unwrap_or(port);
+    match base {
+        "clk" => "Clock".into(),
+        "sw" => "Switch".into(),
+        "btn" => "Button".into(),
+        "led" => "LED".into(),
+        b if b.len() == 2 && b.starts_with('j') => format!("Pmod {}", b.to_ascii_uppercase()),
+        b => match b.split('_').next().unwrap_or(b) {
+            "oled" => "OLED".into(),
+            "hd" => "HDMI".into(),
+            "ac" => "Audio".into(),
+            "vga" => "VGA".into(),
+            other => other.to_ascii_uppercase(),
+        },
+    }
+}
+
+/// The board panel: the board's own pin file (each line's trailing comment
+/// is the board's label), with the run's IO pins joined by package pin.
+pub fn fill_board(view: &mut ImplView) {
+    let Some(board) = helion_xilinx7::parts::board_for_part(&view.part) else {
+        let known: Vec<&str> = helion_xilinx7::parts::BOARDS.iter().map(|b| b.part).collect();
+        view.mark_missing("board", format!("no board in Helion's board table is built on {} (boards: {})", view.part, known.join(", ")));
+        return;
+    };
+    let run: HashMap<&str, &str> = view.io.iter().flat_map(|io| io.pins.iter().map(|p| (p.package_pin.as_str(), p.port.as_str()))).collect();
+    let mut groups: Vec<BoardGroup> = Vec::new();
+    let mut on_board: HashSet<String> = HashSet::new();
+    for line in board.pins.lines() {
+        let (code, label) = line.split_once('#').unwrap_or((line, ""));
+        for (prop, pin, port) in helion_xilinx7::xdc_flow::parse_xdc(code) {
+            if !prop.eq_ignore_ascii_case("PACKAGE_PIN") {
+                continue;
+            }
+            let kind = board_kind(&port);
+            let item = BoardItem {
+                label: if label.trim().is_empty() { port.clone() } else { label.trim().to_string() },
+                port: run.get(pin.as_str()).map(|p| p.to_string()),
+                pin: pin.clone(),
+            };
+            on_board.insert(pin);
+            match groups.iter_mut().find(|g| g.kind == kind) {
+                Some(g) => g.items.push(item),
+                None => groups.push(BoardGroup { kind, items: vec![item] }),
+            }
+        }
+    }
+    let off_board = view
+        .io
+        .iter()
+        .flat_map(|io| io.pins.iter())
+        .filter(|p| !on_board.contains(&p.package_pin))
+        .map(|p| (p.port.clone(), p.package_pin.clone()))
+        .collect();
+    view.board = Some(BoardPanel { board: board.title.to_string(), groups, off_board });
+    view.set_provenance("board", Provenance::new("helion-xilinx7 parts", format!("{} joined to this run's IO pins by package pin", board.xdc), SCOPE));
 }
 
 /// The stage a routed run reaches.
@@ -1067,5 +1221,26 @@ mod tests {
         let v = ImplView::empty(FAMILY, "xc7z020clg484-1", ROUTED_STAGE);
         assert_eq!(v.cols, 0);
         assert!(v.tiles.is_empty());
+    }
+
+    #[test]
+    fn board_panel_joins_the_run_pins_to_the_board_parts_and_lists_the_rest() {
+        let mut v = ImplView::empty(FAMILY, "xc7z020clg484-1", ROUTED_STAGE);
+        let pin = |port: &str, pin: &str| IoPin { port: port.into(), package_pin: pin.into(), bank: None, iostandard: "LVCMOS33".into(), direction: "output" };
+        v.io = Some(IoPlan { pins: vec![pin("oled_dc", "U10"), pin("led", "T22"), pin("dbg", "A1")], package_pins: 0 });
+        fill_board(&mut v);
+        let b = v.board.as_ref().expect("ZedBoard panel");
+        let (g, i) = b.part_of("oled_dc").expect("oled_dc on the board");
+        assert_eq!((g.kind.as_str(), i.label.as_str()), ("OLED", "OLED-DC"));
+        assert_eq!(b.part_of("led").map(|(g, i)| (g.kind.as_str(), i.label.as_str())), Some(("LED", "LD0")));
+        assert_eq!(b.off_board, vec![("dbg".to_string(), "A1".to_string())]);
+        for k in ["Clock", "Switch", "Button", "LED", "Pmod JA", "Pmod JD", "OLED", "HDMI", "Audio", "VGA"] {
+            assert!(b.groups.iter().any(|g| g.kind == k), "no {k} group");
+        }
+        let unused = b.groups.iter().flat_map(|g| &g.items).filter(|i| i.port.is_none()).count();
+        assert_eq!(unused + 2, b.groups.iter().map(|g| g.items.len()).sum::<usize>(), "unused parts stay listed");
+        let mut none = ImplView::empty(FAMILY, "xc7k325tffg900-2", ROUTED_STAGE);
+        fill_board(&mut none);
+        assert!(none.board.is_none() && none.missing["board"].contains("xc7k325tffg900-2"));
     }
 }

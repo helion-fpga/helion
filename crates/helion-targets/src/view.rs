@@ -480,31 +480,206 @@ pub struct DrcViolation {
     pub message: String,
 }
 
-/// The ZedBoard (or any board) panel: the physical bits the XDC names.
+/// The board panel: every part of the board's own pin file, and what the
+/// run's constraints put on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoardPanel {
     pub board: String,
     pub groups: Vec<BoardGroup>,
+    /// Pins the run constrains that no board part uses: `(port, package pin)`.
+    pub off_board: Vec<(String, String)>,
 }
 
-/// A group of board features of one kind.
+impl BoardPanel {
+    /// Board parts the run uses.
+    pub fn used(&self) -> impl Iterator<Item = (&BoardGroup, &BoardItem)> {
+        self.groups.iter().flat_map(|g| g.items.iter().map(move |i| (g, i))).filter(|(_, i)| i.port.is_some())
+    }
+
+    /// The board part a design port lands on.
+    pub fn part_of(&self, port: &str) -> Option<(&BoardGroup, &BoardItem)> {
+        self.used().find(|(_, i)| i.port.as_deref() == Some(port))
+    }
+}
+
+/// A group of board parts of one kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoardGroup {
-    /// `"LED"`, `"Switch"`, `"Button"`, `"Pmod"`, `"OLED"`, `"HDMI"`,
-    /// `"Audio"`, `"Clock"`.
+    /// `"LED"`, `"Switch"`, `"Button"`, `"Pmod JA"`, `"OLED"`, `"HDMI"`,
+    /// `"Audio"`, `"VGA"`, `"Clock"`.
     pub kind: String,
     pub items: Vec<BoardItem>,
 }
 
-/// One board feature and what it connects to.
+/// One board part and what it connects to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoardItem {
-    /// Label from the board's XDC (`led[3]`, `sw[0]`).
+    /// The board's own label for the pin (`LD3`, `BTNC`, `JA1`, `OLED-DC`).
     pub label: String,
     /// Package pin.
     pub pin: String,
-    /// The design port it is wired to, when used.
+    /// The design port wired to it in this run, when used.
     pub port: Option<String>,
+}
+
+/// Which netlist a schematic draws, the way Vivado names its three views.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NetlistStage {
+    /// Elaborated: word-level operators, registers and ports.
+    Rtl,
+    /// Mapped to the family's primitives.
+    Synthesized,
+    /// The mapped netlist with each cell's site and BEL.
+    Implemented,
+}
+
+impl NetlistStage {
+    pub const ALL: [NetlistStage; 3] = [NetlistStage::Rtl, NetlistStage::Synthesized, NetlistStage::Implemented];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NetlistStage::Rtl => "RTL",
+            NetlistStage::Synthesized => "Synthesized",
+            NetlistStage::Implemented => "Implemented",
+        }
+    }
+
+    /// Section name in [`ImplView::missing`] and [`ImplView::provenance`].
+    pub fn section(self) -> &'static str {
+        match self {
+            NetlistStage::Rtl => "schematic-rtl",
+            NetlistStage::Synthesized => "schematic-synthesized",
+            NetlistStage::Implemented => "schematic-implemented",
+        }
+    }
+}
+
+/// One pin of a netlist cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetlistPin {
+    pub name: String,
+    pub output: bool,
+    pub net: String,
+}
+
+/// One netlist cell: its type in the family's (or RTL) terms, its pins and,
+/// in the implemented netlist, where it was placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetlistCell {
+    pub name: String,
+    /// `RTL_ADD`, `LUT4`, `FDRE`, `CARRY4`, `IBUF`, ...
+    pub kind: String,
+    pub pins: Vec<NetlistPin>,
+    pub site: Option<String>,
+    pub bel: Option<String>,
+}
+
+/// One net: its drivers and loads as `cell/pin`, or a bare top-level port
+/// name. More than one driver is kept, not dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetlistNet {
+    pub name: String,
+    pub drivers: Vec<String>,
+    pub loads: Vec<String>,
+}
+
+/// A top-level port and the nets it connects to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetlistPort {
+    pub name: String,
+    /// `"input"`, `"output"` or `"inout"`.
+    pub direction: &'static str,
+    pub nets: Vec<String>,
+}
+
+/// A whole netlist at one stage, for the Schematic view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchematicNetlist {
+    pub stage: NetlistStage,
+    pub top: String,
+    pub ports: Vec<NetlistPort>,
+    pub cells: Vec<NetlistCell>,
+    pub nets: Vec<NetlistNet>,
+    /// Hierarchy instances `(instance, module)` the source had.
+    pub instances: Vec<(String, String)>,
+}
+
+impl SchematicNetlist {
+    /// The netlist of a Helion IR design. `kind` names a cell's type from
+    /// the cell and its connected pin names; `is_output` says whether a pin
+    /// drives its net. A port's nets come from its `NET` attribute (comma
+    /// separated) when it has one, else the net of the port's own name.
+    pub fn from_ir(
+        d: &helion_ir::Design,
+        stage: NetlistStage,
+        kind: impl Fn(&helion_ir::Cell, &[NetlistPin]) -> String,
+        is_output: impl Fn(&helion_ir::Cell, &str) -> bool,
+    ) -> Self {
+        use helion_ir::resolve;
+        let cell_ix: std::collections::HashMap<&str, usize> = d.cells.iter().enumerate().map(|(i, c)| (resolve(c.name), i)).collect();
+        let mut pins: Vec<Vec<NetlistPin>> = vec![Vec::new(); d.cells.len()];
+        let mut nets: Vec<NetlistNet> = Vec::with_capacity(d.nets.len());
+        for n in &d.nets {
+            let name = resolve(n.name).to_string();
+            let mut net = NetlistNet { name: name.clone(), drivers: Vec::new(), loads: Vec::new() };
+            for e in &n.endpoints {
+                let (cell, pin) = (resolve(e.cell), resolve(e.pin));
+                let output = cell_ix.get(cell).is_some_and(|&i| is_output(&d.cells[i], pin));
+                if let Some(&i) = cell_ix.get(cell) {
+                    pins[i].push(NetlistPin { name: pin.to_string(), output, net: name.clone() });
+                }
+                if output { &mut net.drivers } else { &mut net.loads }.push(format!("{cell}/{pin}"));
+            }
+            nets.push(net);
+        }
+        let ports: Vec<NetlistPort> = d
+            .ports
+            .iter()
+            .map(|p| NetlistPort {
+                name: resolve(p.name).to_string(),
+                direction: match p.dir {
+                    helion_ir::PortDir::In => "input",
+                    helion_ir::PortDir::Out => "output",
+                    helion_ir::PortDir::Inout => "inout",
+                },
+                nets: match p.attrs.get("NET") {
+                    Some(v) => v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+                    None => vec![resolve(p.name).to_string()],
+                },
+            })
+            .collect();
+        let net_ix: std::collections::HashMap<String, usize> = nets.iter().enumerate().map(|(i, n)| (n.name.clone(), i)).collect();
+        for p in &ports {
+            for n in &p.nets {
+                if let Some(&i) = net_ix.get(n) {
+                    if p.direction == "input" { &mut nets[i].drivers } else { &mut nets[i].loads }.push(p.name.clone());
+                }
+            }
+        }
+        let cells = d
+            .cells
+            .iter()
+            .zip(pins)
+            .map(|(c, pins)| NetlistCell { name: resolve(c.name).to_string(), kind: kind(c, &pins), pins, site: None, bel: None })
+            .collect();
+        SchematicNetlist {
+            stage,
+            top: resolve(d.name).to_string(),
+            ports,
+            cells,
+            nets,
+            instances: d.instances.iter().map(|i| (resolve(i.name).to_string(), resolve(i.module).to_string())).collect(),
+        }
+    }
+
+    /// Cell count per type, sorted by type.
+    pub fn kinds(&self) -> BTreeMap<&str, usize> {
+        let mut m = BTreeMap::new();
+        for c in &self.cells {
+            *m.entry(c.kind.as_str()).or_insert(0) += 1;
+        }
+        m
+    }
 }
 
 /// Family-specific extra layers. A view enables these when present and never
@@ -558,6 +733,8 @@ pub struct ImplView {
     pub drc: Vec<DrcViolation>,
     /// Board panel, when the project pins a known board.
     pub board: Option<BoardPanel>,
+    /// The design's netlist at each stage the run kept, in stage order.
+    pub schematic: Vec<SchematicNetlist>,
     /// Family-specific extra layers.
     pub layers: Layers,
     /// Provenance per section, keyed by section name (`"placement"`,
@@ -593,6 +770,7 @@ impl ImplView {
             high_fanout: Vec::new(),
             drc: Vec::new(),
             board: None,
+            schematic: Vec::new(),
             layers: Layers::default(),
             provenance: BTreeMap::new(),
             missing: BTreeMap::new(),
@@ -607,6 +785,11 @@ impl ImplView {
     /// Record where a section's values came from.
     pub fn set_provenance(&mut self, section: &str, p: Provenance) {
         self.provenance.insert(section.to_string(), p);
+    }
+
+    /// The netlist of one schematic stage, when the run kept it.
+    pub fn netlist(&self, stage: NetlistStage) -> Option<&SchematicNetlist> {
+        self.schematic.iter().find(|n| n.stage == stage)
     }
 
     /// Tiles of one class.

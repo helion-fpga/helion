@@ -24,6 +24,9 @@ pub struct Built {
     pub routed: crate::backend::Routed7,
     /// The synthesized netlist (pins from the XDC on its ports).
     pub design: Design,
+    /// The elaborated netlist from the v2 front end (`None` when the zb
+    /// front end built the design: it keeps no word-level netlist).
+    pub rtl: Option<Design>,
     /// The backend, which owns the device model the sites refer to.
     pub backend: Xilinx7Backend,
     /// Timing: worst slack per clock and the worst path.
@@ -63,7 +66,7 @@ fn synth_zb(paths: &[&str], top: Option<&str>) -> Result<Design, String> {
 /// The current front end. VHDL goes through the VHDL-to-SystemVerilog
 /// translator first; the second value lists the VHDL port names it had to
 /// rename (SystemVerilog keywords), as `(VHDL name, netlist name)`.
-fn synth_v2(paths: &[&str], top: Option<&str>, log: &mut dyn FnMut(&str)) -> Result<(Design, Vec<(String, String)>), String> {
+fn synth_v2(paths: &[&str], top: Option<&str>, log: &mut dyn FnMut(&str)) -> Result<(Design, Vec<(String, String)>, Option<Design>), String> {
     helion_sv::v2::set_hard(true);
     // The router does not build SRL16E/SRLC32E pins yet (HELION_GAPS G53):
     // shift registers stay flops unless HELION_V2_SRL=1.
@@ -88,27 +91,28 @@ fn synth_v2(paths: &[&str], top: Option<&str>, log: &mut dyn FnMut(&str)) -> Res
     }
     LUT_LEVELS.store(s.depth as usize, std::sync::atomic::Ordering::Relaxed);
     say!(log, "zedbit synth: v2 front end, {} LUTs, {} flops, {} LUT levels", s.luts, s.ffs, s.depth);
-    Ok((s.design, renames))
+    Ok((s.design, renames, Some(s.rtl)))
 }
 
 /// LUT levels from the front end (G44: the summary line reports it, and
 /// `synth()` does not return it, so the synthesis pass records it here).
 static LUT_LEVELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-pub fn synth(design_arg: &str, top: Option<&str>, front: &str, log: &mut dyn FnMut(&str)) -> Result<(Design, Vec<(String, String)>), String> {
+/// The third value is the elaborated (RTL) netlist; the zb front end has none.
+pub fn synth(design_arg: &str, top: Option<&str>, front: &str, log: &mut dyn FnMut(&str)) -> Result<(Design, Vec<(String, String)>, Option<Design>), String> {
     let paths: Vec<&str> = design_arg.split(',').filter(|p| !p.is_empty()).collect();
     if paths.is_empty() {
         return Err("no design file".into());
     }
     match front {
-        "zb" => synth_zb(&paths, top).map(|d| (d, Vec::new())),
+        "zb" => synth_zb(&paths, top).map(|d| (d, Vec::new(), None)),
         "v2" => synth_v2(&paths, top, log),
         "auto" => match synth_v2(&paths, top, &mut *log) {
             Ok(d) => Ok(d),
             Err(e) => {
                 say!(log, "zedbit: v2 front end: {e}");
                 say!(log, "zedbit: using the zb front end for this design");
-                synth_zb(&paths, top).map(|d| (d, Vec::new()))
+                synth_zb(&paths, top).map(|d| (d, Vec::new(), None))
             }
         },
         other => Err(format!("unknown front end `{other}` (auto, v2, zb)")),
@@ -116,7 +120,7 @@ pub fn synth(design_arg: &str, top: Option<&str>, front: &str, log: &mut dyn FnM
 }
 
 /// XDC properties per port-bit key (`clk`, `led[3]`).
-fn parse_xdc(text: &str) -> Vec<(String, String, String)> {
+pub fn parse_xdc(text: &str) -> Vec<(String, String, String)> {
     // (property, value, port pattern)
     let mut out = Vec::new();
     let mut stmt = String::new();
@@ -375,7 +379,7 @@ pub fn run(
             Err(e) => say!(log, "zedbit: no PS7 cell for this part: {e}"),
         }
     }
-    let (mut design, renames) = synth(design_path, top, front, &mut *log)?;
+    let (mut design, renames, rtl) = synth(design_path, top, front, &mut *log)?;
     let t_synth = t0.elapsed();
     for k in ["SIM_ONLY", "NO_BODY", "WIDE_CONE", "ASSIGN_NOT_LOWERED", "GENERATE_NOT_LOWERED", "FLATTEN_CAP"] {
         if design.attrs.get(k).is_some() {
@@ -663,6 +667,7 @@ pub fn run(
         period_ns: ta.period_ps as f64 / 1000.0,
         routed,
         design,
+        rtl,
         backend: be,
         timing: ta,
         periods,

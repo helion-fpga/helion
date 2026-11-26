@@ -153,17 +153,24 @@ pub struct Board {
     pub xdc: &'static str,
     /// The board's own name.
     pub title: &'static str,
+    /// The text of `xdc`, built in so the IDE needs no repository checkout.
+    pub pins: &'static str,
 }
 
 /// Boards with constraints in the repository. Pins come from the vendors'
 /// master constraint files and are checked against the database's package
 /// pin tables by `tests/boards.rs`.
 pub const BOARDS: &[Board] = &[
-    Board { name: "zedboard", aliases: &["zed"], part: "xc7z020clg484-1", xdc: "boards/zedboard.xdc", title: "Avnet/Digilent ZedBoard" },
-    Board { name: "arty-a7-35", aliases: &["arty", "arty-a7"], part: "xc7a35tcsg324-1", xdc: "boards/arty-a7-35.xdc", title: "Digilent Arty A7-35T" },
-    Board { name: "basys3", aliases: &["basys-3"], part: "xc7a35tcpg236-1", xdc: "boards/basys3.xdc", title: "Digilent Basys 3" },
-    Board { name: "nexys-a7-100t", aliases: &["nexys-a7", "nexys4-ddr"], part: "xc7a100tcsg324-1", xdc: "boards/nexys-a7-100t.xdc", title: "Digilent Nexys A7-100T" },
+    Board { name: "zedboard", aliases: &["zed"], part: "xc7z020clg484-1", xdc: "boards/zedboard.xdc", pins: include_str!("../../../boards/zedboard.xdc"), title: "Avnet/Digilent ZedBoard" },
+    Board { name: "arty-a7-35", aliases: &["arty", "arty-a7"], part: "xc7a35tcsg324-1", xdc: "boards/arty-a7-35.xdc", pins: include_str!("../../../boards/arty-a7-35.xdc"), title: "Digilent Arty A7-35T" },
+    Board { name: "basys3", aliases: &["basys-3"], part: "xc7a35tcpg236-1", xdc: "boards/basys3.xdc", pins: include_str!("../../../boards/basys3.xdc"), title: "Digilent Basys 3" },
+    Board { name: "nexys-a7-100t", aliases: &["nexys-a7", "nexys4-ddr"], part: "xc7a100tcsg324-1", xdc: "boards/nexys-a7-100t.xdc", pins: include_str!("../../../boards/nexys-a7-100t.xdc"), title: "Digilent Nexys A7-100T" },
 ];
+
+/// The first board built on `part` (full part name, any case).
+pub fn board_for_part(part: &str) -> Option<&'static Board> {
+    BOARDS.iter().find(|b| b.part.eq_ignore_ascii_case(part))
+}
 
 /// Look a board up by name or alias.
 pub fn board(name: &str) -> Result<&'static Board, String> {

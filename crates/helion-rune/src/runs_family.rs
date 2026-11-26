@@ -319,7 +319,7 @@ pub fn run_xdc_synth(source: &Path, part: &str, send: &dyn Fn(String, MsgSev)) -
     }
     let design_arg = srcs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(",");
     let mut log = |l: &str| send(l.to_string(), MsgSev::Info);
-    let (design, _) = helion_targets::xdc_flow::synth(&design_arg, top.as_deref(), "auto", &mut log)?;
+    let (design, _, _) = helion_targets::xdc_flow::synth(&design_arg, top.as_deref(), "auto", &mut log)?;
     let be = helion_targets::xdc_flow_types::Xilinx7Backend::open(part)?;
     let packed = be.pack(&design)?;
     let stem = helion_ir::resolve(design.name).to_string();
