@@ -211,20 +211,75 @@ pub fn report_timing(
     })
 }
 
-/// Slow-corner cell delays (ps), from Project X-Ray's zynq7/artix7 SDF
-/// (`timings/CLBLL_L.sdf`): LUT A*->O6, FF CLK->Q, FF setup, carry paths.
+/// Slow-corner cell delays (ps), xc7z020 -1. The LUT and carry values are
+/// Project X-Ray's SDF (`timings/CLBLL_L.sdf`); the flop values are the
+/// signoff values a vendor timer reports for the same cells (clock-to-Q
+/// 456 ps on 488 of 488 flops of a PicoRV32 build; X-Ray's SDF lists 303 as
+/// the smallest of three variants, which made every path 153 ps short).
 pub const LUT_PS: u32 = 124;
-pub const FF_CKQ_PS: u32 = 303;
-pub const FF_SETUP_PS: u32 = 109;
+/// LUT arc when the input net leaves its driver's slice through AMUX..DMUX
+/// (a carry sum bit, an F7/F8 output): measured 287-355 ps, median 299, on
+/// 501 of 505 such inputs; every other driver pin gives 116-157 ps.
+pub const LUT_XMUX_PS: u32 = 299;
+pub const FF_CKQ_PS: u32 = 456;
+/// D setup. Measured -118..+47 ps on 95% of flops; the other 5% (190-264 ps)
+/// is not yet tied to a D source (shortcut: one value for every D input).
+pub const FF_SETUP_PS: u32 = 47;
+/// CE and synchronous set/reset setup (measured 205 and 524 ps).
+pub const FF_CE_SETUP_PS: u32 = 205;
+pub const FF_SR_SETUP_PS: u32 = 524;
 /// O6 -> FFMUX -> D and O6 -> carry S inside the slice.
 pub const SITE_INTERNAL_PS: u32 = 60;
-/// S -> O (sum) through one CARRY4 and CI -> CO through one CARRY4.
+/// Coarse carry delays, used by the placer's estimate; the timer uses the
+/// per-bit tables below.
 pub const CARRY_S_TO_O_PS: u32 = 520;
 pub const CARRY_CI_TO_CO_PS: u32 = 293;
+/// CARRY4 arcs from X-Ray's SDF, slow max; column 0-3 is O0-O3, column 4 is
+/// CO3 (the CO0-CO2 taps are timed like CO3). 0: no arc.
+pub const CARRY_S_PS: [[u32; 5]; 4] = [
+    [223, 400, 523, 582, 508],
+    [0, 205, 558, 618, 528],
+    [0, 0, 226, 330, 376],
+    [0, 0, 0, 227, 380],
+];
+pub const CARRY_CI_PS: [u32; 5] = [235, 348, 256, 329, 114];
+pub const CARRY_CYINIT_PS: [u32; 5] = [491, 613, 600, 657, 580];
+/// F7 and F8 multiplexers, data input -> O (X-Ray `slicem.sdf`, slow max).
+pub const MUXF7_PS: u32 = 193;
+pub const MUXF8_PS: u32 = 104;
+/// SRL: clock -> O6 and clock -> MC31, and data-in setup (X-Ray SDF).
+pub const SRL_CKO_PS: u32 = 1472;
+pub const SRL_CK_MC31_PS: u32 = 1114;
+pub const SRL_SETUP_PS: u32 = 461;
 /// Route delay assumed for a fabric load the router left no delay for.
 pub const UNKNOWN_ROUTE_PS: u32 = 1200;
-/// Margin for clock skew/uncertainty and model error.
-pub const MARGIN_PS: u32 = 400;
+/// Clock uncertainty (35 ps on every path of a 25 ns-or-faster clock) plus
+/// clock skew within one buffer's tree (p90 199 ps over 282 measured paths).
+pub const MARGIN_PS: u32 = 235;
+
+/// What the router's delay misses on a fabric connection, in ps, for a driver
+/// and load slice `d` sites apart (Manhattan).
+///
+/// The router sums X-Ray's pip delays only: this database has no wire
+/// resistance/capacitance for 568 of INT's 600 wires, and no site-pin delay.
+/// Against a vendor-routed PicoRV32 (20,261 loads) its delays were 50-60% low
+/// at every distance (median 668 vs 1,373 ps at 5-9 sites). This is the
+/// least-error fit of the per-distance medians (mean error 71 ps over d = 0-19);
+/// past 13 sites long wires take over and the gap stops growing.
+pub fn net_extra_ps(d: u32) -> u32 {
+    130 + 95 * d.min(13)
+}
+
+/// `net_extra_ps` between two sites, or its value at 6 sites (the median
+/// connection) when either is not a slice (block RAM, DSP and I/O sites have
+/// their own coordinate grids).
+fn net_extra_between(a: Option<&str>, b: &str) -> u32 {
+    let xy = |s: &str| s.starts_with("SLICE_").then(|| crate::place::parse_site_xy(s)).flatten();
+    match (a.and_then(xy), xy(b)) {
+        (Some((ax, ay)), Some((bx, by))) => net_extra_ps(ax.abs_diff(bx) + ay.abs_diff(by)),
+        _ => net_extra_ps(6),
+    }
+}
 /// Block RAM, slow corner from X-Ray's `timings/BRAM_L.sdf`: CLK -> DO
 /// without the output register, and the worst input setup (DI; address,
 /// WE, EN and reset are shorter).
@@ -303,6 +358,8 @@ pub fn dsp_comb_ps(d: &crate::pack::PackedDsp, pin: &str) -> Option<u32> {
 /// by a register before it, if any, and reached through each input.
 struct DspArc<'a> {
     name: &'a str,
+    /// `DSP48E1`, `MUXF7` or `MUXF8`.
+    kind: &'a str,
     site: &'a str,
     launch: Option<u32>,
     ins: Vec<(&'a str, &'a str, u32)>,
@@ -612,15 +669,34 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     }
     // Pins as the router named them: LUT inputs A1..D6 (letter from BEL).
     let lut_letter: HashMap<&str, char> = placed.luts.iter().map(|l| (l.name.as_str(), l.bel.chars().next().unwrap_or('A'))).collect();
+    // Driver site of every net, for the distance part of a connection's delay.
+    let mut drv_site: HashMap<&str, &str> = HashMap::new();
+    for l in &packed.luts {
+        if let Some(s) = site_of.get(l.name.as_str()) {
+            drv_site.insert(l.output_net.as_str(), s);
+        }
+    }
+    for f in &packed.ffs {
+        if let Some(s) = site_of.get(f.name.as_str()) {
+            drv_site.insert(f.q_net.as_str(), s);
+        }
+    }
+    for c in &packed.carries {
+        if let Some(s) = site_of.get(c.name.as_str()) {
+            for n in c.o_nets.iter().chain(std::iter::once(&c.co_net)).chain(c.co_nets.iter()).flatten() {
+                drv_site.insert(n.as_str(), s);
+            }
+        }
+    }
     let route = |net: &str, site: &str, pin: &str, internal: bool| -> u32 {
-        if internal {
+        // F7/F8 inputs come from the slice's own LUTs.
+        if internal || pin.starts_with("F7F8_") {
             return SITE_INTERNAL_PS;
         }
-        routed
-            .load_delays
-            .get(&(net.to_string(), site.to_string(), pin.to_string()))
-            .copied()
-            .unwrap_or(UNKNOWN_ROUTE_PS)
+        match routed.load_delays.get(&(net.to_string(), site.to_string(), pin.to_string())) {
+            Some(&d) => d + net_extra_between(drv_site.get(net).copied(), site),
+            None => UNKNOWN_ROUTE_PS,
+        }
     };
     // Arrival at a net's driver output, with the path that produced it.
     let mut memo: HashMap<String, (u32, Vec<PathStep>)> = HashMap::new();
@@ -661,7 +737,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                 let (a, mut p) = arrival(inn, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
                 let w = route(inn, d.site, pin, false);
                 if !p.is_empty() && (a + w + ps > best.0 || best.1.is_empty()) {
-                    p.push(PathStep { what: format!("{} (DSP48E1 {pin} -> P)", d.name), arrival_ps: a + w + ps, wire_ps: w, xy: None });
+                    p.push(PathStep { what: format!("{} ({} {pin} -> {})", d.name, d.kind, if d.kind == "DSP48E1" { "P" } else { "O" }), arrival_ps: a + w + ps, wire_ps: w, xy: None });
                     best = (a + w + ps, p);
                 }
             }
@@ -694,15 +770,18 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
                     continue; // launched by a pad or constant: unconstrained
                 }
                 let w = route(inn, site, &format!("{letter}{}", k + 1), false);
-                if a + w > best.0 || best.1.is_empty() {
-                    best = (a + w, p);
+                // The arc is slow when this input leaves its driver's slice on AMUX..DMUX.
+                let xmux = matches!(carry_by_net.get(inn.as_str()), Some((_, Some(_)))) || dsp_comb.get(inn.as_str()).is_some_and(|d| d.kind.starts_with("MUXF"));
+                let t = a + w + if xmux { LUT_XMUX_PS } else { LUT_PS };
+                if t > best.0 || best.1.is_empty() {
+                    best = (t, p);
                     wire = w;
                 }
             }
             if best.1.is_empty() {
                 (0, Vec::new())
             } else {
-                let t = best.0 + LUT_PS;
+                let t = best.0;
                 let mut p = best.1;
                 p.push(PathStep { what: format!("{} (LUT, {site})", l.name), arrival_ps: t, wire_ps: wire, xy: xy_of.get(l.name.as_str()).copied() });
                 (t, p)
@@ -711,32 +790,37 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let site = site_of.get(c.name.as_str()).copied().unwrap_or("");
             let mut best = (0u32, Vec::new());
             let mut wire = 0;
-            let upto = j.map(|j| j + 1).unwrap_or(4);
-            for s in c.s_nets.iter().take(upto).flatten() {
+            let out = j.unwrap_or(4); // O0..O3, or 4 for CO3 and the taps
+            for (k, s) in c.s_nets.iter().enumerate() {
+                let Some(s) = s else { continue };
+                let arc = CARRY_S_PS[k][out];
+                if arc == 0 {
+                    continue;
+                }
                 let (a, p) = arrival(s, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
                 if p.is_empty() {
                     continue;
                 }
                 let w = route(s, site, "S", true);
-                if a + w > best.0 || best.1.is_empty() {
-                    best = (a + w, p);
+                if a + w + arc > best.0 || best.1.is_empty() {
+                    best = (a + w + arc, p);
                     wire = w;
                 }
             }
             if c.cyinit.is_none() && !c.ci_net.is_empty() {
                 let (a, p) = arrival(&c.ci_net, depth + 1, memo, visiting, lut_by_out, ff_by_q, carry_by_net, site_of, lut_letter, route, bram_out, dsp_out, xy_of, lr, dsp_comb)?;
                 let cascade = carry_by_net.get(c.ci_net.as_str()).map(|(_, j)| j.is_none()).unwrap_or(false);
-                let w = if cascade { 0 } else { route(&c.ci_net, site, "AX", false) };
-                if !p.is_empty() && (a + w > best.0 || best.1.is_empty()) {
-                    best = (a + w, p);
+                // Not a cascade: the chain's carry-in enters on AX through CYINIT.
+                let (w, arc) = if cascade { (0, CARRY_CI_PS[out]) } else { (route(&c.ci_net, site, "AX", false), CARRY_CYINIT_PS[out]) };
+                if !p.is_empty() && (a + w + arc > best.0 || best.1.is_empty()) {
+                    best = (a + w + arc, p);
                     wire = w;
                 }
             }
             if best.1.is_empty() {
                 (0, Vec::new())
             } else {
-                let add = if j.is_some() { CARRY_S_TO_O_PS } else { CARRY_CI_TO_CO_PS };
-                let t = best.0 + add;
+                let t = best.0;
                 let mut p = best.1;
                 p.push(PathStep { what: format!("{} (CARRY4, {})", c.name, site_of.get(c.name.as_str()).copied().unwrap_or("?")), arrival_ps: t, wire_ps: wire, xy: xy_of.get(c.name.as_str()).copied() });
                 (t, p)
@@ -823,8 +907,21 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             dsp_in.push((net, pp.site.as_str(), pin.to_string(), ps, "PS7"));
         }
     }
+    // Shift-register LUTs: Q and Q31 launch from the clock; D is a setup
+    // endpoint on the SRL's own LUT letter pin (AI..DI).
+    for r in &packed.srls {
+        let Some(pr) = placed.srls.iter().find(|p| p.name == r.name) else { continue };
+        dsp_out.insert(r.q_net.as_str(), (format!("{} (SRL Q, clock {}, {})", r.name, r.clk_net, pr.site), SRL_CKO_PS));
+        if let Some(q31) = &r.q31_net {
+            dsp_out.insert(q31.as_str(), (format!("{} (SRL Q31, clock {}, {})", r.name, r.clk_net, pr.site), SRL_CK_MC31_PS));
+        }
+        if r.clk_net == domain {
+            let letter = pr.bel.chars().next().unwrap_or('D');
+            dsp_in.push((r.d_net.as_str(), pr.site.as_str(), format!("{letter}I"), SRL_SETUP_PS, "SRL"));
+        }
+    }
     let lr = crate::lutram::read_arcs(placed);
-    let arcs: Vec<(Vec<&str>, DspArc)> = packed
+    let mut arcs: Vec<(Vec<&str>, DspArc)> = packed
         .dsps
         .iter()
         .filter(|d| d.preg == 0)
@@ -834,9 +931,19 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let outs = d.pins.iter().filter(|p| p.2 && p.0.starts_with('P')).map(|p| p.1.as_str()).collect();
             let regs = [d.areg, d.breg, d.creg, d.dreg, d.adreg, d.mreg, d.opmodereg, d.alumodereg, d.inmodereg, d.carryinreg, d.carryinselreg];
             let launch = regs.iter().any(|&r| r > 0).then(|| dsp_cko_ps(d));
-            Some((outs, DspArc { name: d.name.as_str(), site: pd.site.as_str(), launch, ins }))
+            Some((outs, DspArc { name: d.name.as_str(), kind: "DSP48E1", site: pd.site.as_str(), launch, ins }))
         })
         .collect();
+    // F7/F8 multiplexers: combinational, inputs from the slice's own LUTs.
+    for m in &packed.muxfs {
+        let Some(pm) = placed.muxfs.iter().find(|p| p.name == m.name) else { continue };
+        let (kind, ps) = match m.kind {
+            crate::pack::MuxfKind::Muxf7 => ("MUXF7", MUXF7_PS),
+            crate::pack::MuxfKind::Muxf8 => ("MUXF8", MUXF8_PS),
+        };
+        let ins = vec![(m.i0_net.as_str(), "F7F8_I0", ps), (m.i1_net.as_str(), "F7F8_I1", ps)];
+        arcs.push((vec![m.o_net.as_str()], DspArc { name: m.name.as_str(), kind, site: pm.site.as_str(), launch: None, ins }));
+    }
     let mut dsp_comb: HashMap<&str, &DspArc> = HashMap::new();
     for (outs, arc) in &arcs {
         for &n in outs {
@@ -857,16 +964,16 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         let internal_d = matches!(crate::place::ff_d_source(pff, placed), crate::place::FfDSource::LutO6 | crate::place::FfDSource::CarryXor);
         let letter = pff.bel.chars().next().unwrap_or('A');
         let d_pin = if internal_d { format!("{letter}FF_D") } else { format!("{letter}X") };
-        let mut inputs: Vec<(&str, String, bool)> = vec![(ff.d_net.as_str(), d_pin, internal_d)];
+        let mut inputs: Vec<(&str, String, bool, u32)> = vec![(ff.d_net.as_str(), d_pin, internal_d, FF_SETUP_PS)];
         if let Some(ce) = &ff.ce_net {
-            inputs.push((ce.as_str(), "CE".into(), false));
+            inputs.push((ce.as_str(), "CE".into(), false, FF_CE_SETUP_PS));
         }
         if let Some(sr) = &ff.sr_net {
             if !ff.sr_async {
-                inputs.push((sr.as_str(), "SR".into(), false));
+                inputs.push((sr.as_str(), "SR".into(), false, FF_SR_SETUP_PS));
             }
         }
-        for (net, pin, internal) in inputs {
+        for (net, pin, internal, setup) in inputs {
             let (a, mut p) = arrival(net, 0, &mut memo, &mut visiting, &lut_by_out, &ff_by_q, &carry_by_net, &site_of, &lut_letter, &route, &&bram_out, &dsp_out, &xy_of, &lr, &dsp_comb)?;
             if p.is_empty() {
                 continue; // driven by an input pad or a constant: unconstrained
@@ -874,7 +981,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let w = route(net, &pff.site, &pin, internal);
             let t = a + w;
             endpoints += 1;
-            let slack = period_ps as i64 - FF_SETUP_PS as i64 - MARGIN_PS as i64 - t as i64;
+            let slack = period_ps as i64 - setup as i64 - MARGIN_PS as i64 - t as i64;
             if slack < 0 {
                 failing += 1;
             }
@@ -1076,6 +1183,44 @@ mod tests {
         let _ = &mut packed;
     }
 
+    /// The arcs the vendor timer was measured to charge: a LUT input that
+    /// arrives on a carry sum bit (AMUX..DMUX) costs `LUT_XMUX_PS`, one from a
+    /// flop `LUT_PS`; the sum bit takes S0 -> O0 from the per-bit table; every
+    /// routed connection adds `net_extra_ps` of its slice distance; flops
+    /// launch at `FF_CKQ_PS`. Pins the measured values, so a "tidy-up" back
+    /// to the old 303 ps clock-to-Q or one LUT delay for all inputs fails here.
+    #[test]
+    fn arcs_follow_the_measured_model() {
+        let ff = |name: &str, d: &str, q: &str| crate::pack::PackedFf {
+            name: name.into(), d_net: d.into(), q_net: q.into(), clk_net: "clk".into(),
+            ce_net: None, sr_net: None, init: false, srval: false, sr_async: false,
+        };
+        let lut = |name: &str, i: &str, o: &str| crate::pack::PackedLut { name: name.into(), init: 2, input_nets: [Some(i.into()), None, None, None, None, None], output_net: o.into() };
+        let pff = |name: &str, site: &str, bel: &str| crate::place::PlacedFf { name: name.into(), tile: "CLBLL_L_X2Y0".into(), site: site.into(), bel: bel.into() };
+        let plut = |name: &str, bel: &str| crate::place::PlacedLut { name: name.into(), init: 2, tile: "CLBLL_L_X4Y0".into(), site: "SLICE_X4Y0".into(), bel: bel.into() };
+        let mut r = Routed7::default();
+        let p = &mut r.placed;
+        p.packed.ffs = vec![ff("f0", "x", "q0"), ff("f1", "n1", "q1"), ff("f2", "n2", "q2")];
+        p.ffs = vec![pff("f0", "SLICE_X0Y0", "AFF"), pff("f1", "SLICE_X6Y0", "AFF"), pff("f2", "SLICE_X6Y0", "BFF")];
+        p.packed.carries = vec![crate::pack::PackedCarry { name: "c".into(), cyinit: Some(false), s_nets: [Some("q0".into()), None, None, None], o_nets: [Some("o0".into()), None, None, None], ..Default::default() }];
+        p.carries = vec![crate::place::PlacedCarry { name: "c".into(), tile: "CLBLL_L_X2Y0".into(), site: "SLICE_X2Y0".into() }];
+        p.packed.luts = vec![lut("l1", "o0", "n1"), lut("l2", "q0", "n2")];
+        p.luts = vec![plut("l1", "A6LUT"), plut("l2", "B6LUT")];
+        for (net, site, pin) in [("o0", "SLICE_X4Y0", "A1"), ("q0", "SLICE_X4Y0", "B1"), ("n1", "SLICE_X6Y0", "AX"), ("n2", "SLICE_X6Y0", "BX")] {
+            r.load_delays.insert((net.into(), site.into(), pin.into()), 500);
+        }
+        let a = analyze_clocks(&r, &|_| Some(10_000)).unwrap();
+        // f0 -> carry S0 (inside the slice) -> O0 -> 2 sites -> l1 (slow arc) -> 2 sites -> f1.
+        let via_carry = FF_CKQ_PS + SITE_INTERNAL_PS + CARRY_S_PS[0][0] + 500 + net_extra_ps(2) + LUT_XMUX_PS + 500 + net_extra_ps(2);
+        assert_eq!((a.endpoints, a.wns_ps), (2, 10_000 - (FF_SETUP_PS + MARGIN_PS + via_carry) as i64), "{:?}", a.worst_path);
+        // Without the carry path, f2's path (flop -> 4 sites -> l2, fast arc) is the worst.
+        r.placed.packed.ffs.retain(|f| f.name != "f1");
+        let a = analyze_clocks(&r, &|_| Some(10_000)).unwrap();
+        let via_ff = FF_CKQ_PS + 500 + net_extra_ps(4) + LUT_PS + 500 + net_extra_ps(2);
+        assert_eq!(a.wns_ps, 10_000 - (FF_SETUP_PS + MARGIN_PS + via_ff) as i64, "{:?}", a.worst_path);
+        assert_eq!((FF_CKQ_PS, LUT_PS, LUT_XMUX_PS, MARGIN_PS, net_extra_ps(0), net_extra_ps(13), net_extra_ps(40)), (456, 124, 299, 235, 130, 1365, 1365));
+    }
+
     /// A PS7 port clock no flop shares is still a domain: its input is
     /// timed. A path between it and a flop on another clock is refused.
     #[test]
@@ -1103,7 +1248,8 @@ mod tests {
         let period = |c: &str| (c == "clk_a").then_some(10_000);
         let a = analyze_clocks(&routed, &period).unwrap();
         // ARADDR clock-to-out 1438 + LUT input wire (unknown) + LUT + 2000 to RDATA (setup 550).
-        let t = 1438 + UNKNOWN_ROUTE_PS + LUT_PS + 2000;
+        // The LUT is not placed, so the RDATA connection gets the median-distance extra.
+        let t = 1438 + UNKNOWN_ROUTE_PS + LUT_PS + 2000 + net_extra_ps(6);
         assert_eq!((a.endpoints, a.wns_ps), (1, 10_000 - 550 - MARGIN_PS as i64 - t as i64), "{:?}", a.worst_path);
         let mut into_ff = routed.clone();
         into_ff.placed.packed.ffs.push(ff("f", "r0", "q"));
