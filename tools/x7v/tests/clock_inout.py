@@ -31,9 +31,22 @@ assert r5({**leaf_l, "HCLK_R_X22Y26": ["ENABLE_BUFFER.HCLK_CK_BUFHCLK0"]}) == []
 # The enable must be for the same row clock.
 assert len(r5({**leaf_l, "HCLK_R_X22Y26": ["ENABLE_BUFFER.HCLK_CK_BUFHCLK1"]})) == 1
 # The mirror case: an HCLK_R leaf through the HCLK_L tile's BUFHCLK8..11.
-leaf_r = {"HCLK_R_X22Y26": ["HCLK_LEAF_CLK_B_BOT0.HCLK_CK_OUTIN_R1"]}
+# tileconn stitches HCLK_CK_OUTIN_R4..7 to HCLK_CK_INOUT_L0..3 (BUFHCLK8..11).
+leaf_r = {"HCLK_R_X22Y26": ["HCLK_LEAF_CLK_B_BOT0.HCLK_CK_OUTIN_R5"]}
 assert len(r5(leaf_r)) == 1, r5(leaf_r)
 assert r5({**leaf_r, "HCLK_L_X21Y26": ["ENABLE_BUFFER.HCLK_CK_BUFHCLK9"]}) == []
 # A leaf in the buffer's own tile is R4's business, not R5's.
 assert r5({"HCLK_R_X22Y26": ["HCLK_LEAF_CLK_B_BOT0.HCLK_CK_BUFHCLK0"]}) == []
+
+
+def r6(tiles):
+    dec = SimpleNamespace(tiles={t: SimpleNamespace(features=f) for t, f in tiles.items()})
+    return [e for e in clockcheck.check(db, dec).errors if e.startswith("R6")]
+
+
+# R6: a leaf through the link is an error even with R5's enable set (the
+# XC7S25 columns clocked this way had no clock on the Arty S7-25).
+assert len(r6({**leaf_l, "HCLK_R_X22Y26": ["ENABLE_BUFFER.HCLK_CK_BUFHCLK0"]})) == 1
+assert len(r6(leaf_r)) == 1
+assert r6({"HCLK_R_X22Y26": ["HCLK_LEAF_CLK_B_BOT0.HCLK_CK_BUFHCLK0", "ENABLE_BUFFER.HCLK_CK_BUFHCLK0"]}) == []
 print("clock_inout: ok")
