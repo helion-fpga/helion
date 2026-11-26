@@ -397,6 +397,20 @@ pub struct Analysis {
     pub worst_path: Vec<PathStep>,
     /// Worst slack (ps) of each clock domain, by clock net.
     pub clocks: Vec<(String, i64)>,
+    /// Setup slack of every timed endpoint, all domains.
+    pub endpoint_slacks: Vec<EndpointSlack>,
+}
+
+/// Setup slack at one timed endpoint.
+#[derive(Clone, Debug)]
+pub struct EndpointSlack {
+    /// Clock domain (flop clock net).
+    pub clock: String,
+    /// `cell pin` for a flop input, `site.pin` for a hard block or LUT RAM.
+    pub endpoint: String,
+    /// Site the endpoint sits on.
+    pub site: String,
+    pub slack_ps: i64,
 }
 
 impl Analysis {
@@ -449,9 +463,11 @@ pub fn analyze_clocks_async(
     let mut worst: Option<Analysis> = None;
     let (mut endpoints, mut failing) = (0usize, 0usize);
     let mut clocks = Vec::new();
+    let mut endpoint_slacks = Vec::new();
     for dom in &domains {
         let period = period_of(dom).ok_or_else(|| format!("timing: no period known for clock `{dom}`"))?;
         let a = analyze_domain(routed, dom, period)?;
+        endpoint_slacks.extend(a.endpoint_slacks.iter().cloned());
         endpoints += a.endpoints;
         failing += a.failing_endpoints;
         clocks.push((dom.to_string(), a.wns_ps));
@@ -459,7 +475,7 @@ pub fn analyze_clocks_async(
             worst = Some(a);
         }
     }
-    let mut w = worst.unwrap_or(Analysis { period_ps: 0, wns_ps: 0, failing_endpoints: 0, endpoints: 0, worst_path: Vec::new(), clocks: Vec::new() });
+    let mut w = worst.unwrap_or(Analysis { period_ps: 0, wns_ps: 0, failing_endpoints: 0, endpoints: 0, worst_path: Vec::new(), clocks: Vec::new(), endpoint_slacks: Vec::new() });
     if domains.is_empty() {
         w.period_ps = period_of("").unwrap_or(0);
         w.wns_ps = w.period_ps as i64;
@@ -467,6 +483,7 @@ pub fn analyze_clocks_async(
     w.endpoints = endpoints;
     w.failing_endpoints = failing;
     w.clocks = clocks;
+    w.endpoint_slacks = endpoint_slacks;
     Ok(w)
 }
 
@@ -849,6 +866,10 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     let mut worst_path = Vec::new();
     let mut failing = 0usize;
     let mut endpoints = 0usize;
+    let mut slacks: Vec<EndpointSlack> = Vec::new();
+    let mut record = |endpoint: String, site: &str, slack: i64| {
+        slacks.push(EndpointSlack { clock: domain.to_string(), endpoint, site: site.to_string(), slack_ps: slack })
+    };
     for pff in &placed.ffs {
         let Some(ff) = packed.ffs.iter().find(|f| f.name == pff.name) else { continue };
         if ff.clk_net != domain {
@@ -875,6 +896,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
             let t = a + w;
             endpoints += 1;
             let slack = period_ps as i64 - FF_SETUP_PS as i64 - MARGIN_PS as i64 - t as i64;
+            record(format!("{} {pin}", ff.name), &pff.site, slack);
             if slack < 0 {
                 failing += 1;
             }
@@ -897,6 +919,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         let t = a + route(net, site, pin, false);
         endpoints += 1;
         let slack = period_ps as i64 - setup as i64 - MARGIN_PS as i64 - t as i64;
+        record(format!("{site}.{pin}"), site, slack);
         if slack < 0 {
             failing += 1;
         }
@@ -914,6 +937,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         let t = a + route(net, site, sp, false);
         endpoints += 1;
         let slack = period_ps as i64 - BRAM_SETUP_PS as i64 - MARGIN_PS as i64 - t as i64;
+        record(format!("{site}.{sp}"), site, slack);
         if slack < 0 {
             failing += 1;
         }
@@ -931,6 +955,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
         let t = a + route(net, site, pin, false);
         endpoints += 1;
         let slack = period_ps as i64 - *setup as i64 - MARGIN_PS as i64 - t as i64;
+        record(format!("{site}.{pin}"), site, slack);
         if slack < 0 {
             failing += 1;
         }
@@ -943,7 +968,7 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     if endpoints == 0 {
         wns = period_ps as i64;
     }
-    Ok(Analysis { period_ps, wns_ps: wns, failing_endpoints: failing, endpoints, worst_path, clocks: vec![(domain.to_string(), wns)] })
+    Ok(Analysis { period_ps, wns_ps: wns, failing_endpoints: failing, endpoints, worst_path, clocks: vec![(domain.to_string(), wns)], endpoint_slacks: slacks })
 }
 
 #[cfg(test)]
@@ -1070,7 +1095,7 @@ mod tests {
                 ..Default::default()
             },
             nets: vec![],
-         load_delays: Default::default(), graph_clocks: false };
+         load_delays: Default::default(), graph_clocks: false, net_pins: Default::default() };
         let err = report_timing(&routed, &tm, 10_000).expect_err("cycle must fail");
         assert!(err.contains("cycle"), "{err}");
         let _ = &mut packed;

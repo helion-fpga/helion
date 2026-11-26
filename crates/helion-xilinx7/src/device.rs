@@ -136,6 +136,8 @@ pub struct Tile {
     pub grid_y: i32,
     pub sites: Vec<SiteInst>,
     pub buses: Vec<BusData>,
+    /// Clock region from `tilegrid.json`, when the database records one.
+    pub clock_region: Option<String>,
     /// First global wire id belonging to this tile.
     wire_base: u32,
 }
@@ -377,6 +379,7 @@ impl Device {
                 grid_y: e.grid_y,
                 sites,
                 buses,
+                clock_region: e.clock_region.clone(),
                 wire_base,
             });
         }
@@ -1226,6 +1229,7 @@ impl Device {
                 grid_y: gy,
                 sites,
                 buses,
+                clock_region: None,
                 wire_base,
             });
             idx

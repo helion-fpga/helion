@@ -204,14 +204,17 @@ pub struct Routed7 {
     /// line, HROW, BUFHCE, HCLK leaf, INT clock input); emit derives the
     /// static enables from those pips instead of the fixed spine recipe.
     pub graph_clocks: bool,
+    /// Site pins of every routed net (driver and loads), as the router
+    /// collected them; pins shared inside a site appear once.
+    pub net_pins: HashMap<String, Vec<Endpoint>>,
 }
 
 /// A routing endpoint: site + pin + whether it's a driver.
 #[derive(Clone, Debug)]
-struct Endpoint {
-    site: String,
-    pin: String,
-    is_driver: bool,
+pub struct Endpoint {
+    pub site: String,
+    pub pin: String,
+    pub is_driver: bool,
 }
 
 fn is_const_net(net: &str) -> bool {
@@ -1065,6 +1068,7 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
         nets,
         load_delays,
         graph_clocks,
+        net_pins: net_eps,
     })
 }
 
