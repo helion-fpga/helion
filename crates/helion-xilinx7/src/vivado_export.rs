@@ -36,8 +36,9 @@ pub struct VivadoFiles {
 
 fn is_const(net: &str) -> Option<bool> {
     match net {
-        "0" | "gnd" | "GND" | "$false" => Some(false),
-        "1" | "vcc" | "VCC" | "$true" => Some(true),
+        // Same spellings pack.rs ties off; without const0/const1 they were driverless (Vivado NDRV-1).
+        "0" | "gnd" | "GND" | "$false" | "const0" => Some(false),
+        "1" | "vcc" | "VCC" | "$true" | "const1" => Some(true),
         _ => None,
     }
 }
@@ -810,6 +811,17 @@ mod tests {
         assert!(buses_of("RAM32M").contains(&("DOA", 2)) && buses_of("RAM64M").contains(&("ADDRD", 6)));
         assert!(buses_of("RAM64X1D").is_empty(), "A0..A5 are scalar ports");
         assert!(is_output_pin("RAM64X1D", "DPO") && is_output_pin("RAM32M", "DOD") && !is_output_pin("RAM32M", "DID"));
+    }
+
+    /// pack.rs ties off with const0/const1; the export must read them as constants, not driverless nets (G123).
+    #[test]
+    fn pack_tie_spellings_are_constants() {
+        for (n, v) in [("const0", false), ("const1", true), ("0", false), ("1", true), ("GND", false), ("VCC", true)] {
+            assert_eq!(is_const(n), Some(v), "{n}");
+        }
+        let a = lut(0x1234_5678_9abc_def0, [Some("x"), Some("const0"), Some("const1"), None, None, None], "y");
+        let b = lut(0x1234_5678_9abc_def0, [Some("x"), Some("0"), Some("1"), None, None, None], "y");
+        assert_eq!(lut_function(&a, None), lut_function(&b, None));
     }
 
     /// The compacted LUT equals the physical one: connected pins as given,
