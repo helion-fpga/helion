@@ -79,6 +79,8 @@ pub struct MemState {
     blocking: HashSet<(usize, u32)>,
     /// Set when an `initial` block took a branch that depends on a value.
     pub init_branch: bool,
+    /// Wire -> the hidden read value it wholly is (`assign t = mem[a]`).
+    alias: HashMap<u32, u32>,
 }
 
 /// A port of the block RAM as built.
@@ -413,7 +415,8 @@ impl Elab {
     }
 
     /// Build every memory candidate as block RAM.
-    pub fn build_mems(&mut self) -> R<()> {
+    /// `keep`: the output ports' signals.
+    pub fn build_mems(&mut self, keep: &HashSet<u32>) -> R<()> {
         let mems = std::mem::take(&mut self.mem.mems);
         for (m, mem) in mems.iter().enumerate() {
             if self.dag.nodes.iter().any(|n| matches!(n.op, Op::Read(s) | Op::Hold(s) if s == mem.sig)) {
@@ -425,10 +428,22 @@ impl Elab {
         // Which hidden read signals each node depends on (nodes are built
         // after their operands, so one pass in order covers the graph).
         let rsigs: HashSet<u32> = self.mem.mems.iter().flat_map(|m| m.r.iter().map(|r| r.r)).collect();
+        // A wire that is wholly one read value stands for it where it is
+        // read (the VHDL front end writes every read as `assign t = mem[a]`),
+        // unless it is an output port or a kept net.
+        let mut alias: HashMap<u32, u32> = HashMap::new();
+        for (t, sg) in self.sigs.iter().enumerate() {
+            let Some(&Drv::Comb(v, 0)) = sg.drv.first() else { continue };
+            let Op::Read(r) = *self.dag.op(v) else { continue };
+            if rsigs.contains(&r) && !sg.debug && !keep.contains(&(t as u32)) && self.dag.w(v) as usize == sg.drv.len() && sg.drv.iter().enumerate().all(|(i, d)| *d == Drv::Comb(v, i as u32)) {
+                alias.insert(t as u32, r);
+            }
+        }
         let mut reads: Vec<Vec<u32>> = Vec::with_capacity(self.dag.nodes.len());
         for n in 0..self.dag.nodes.len() as N {
             let mut v: Vec<u32> = match self.dag.op(n) {
                 Op::Read(s) if rsigs.contains(s) => vec![*s],
+                Op::Read(s) => alias.get(s).map(|r| vec![*r]).unwrap_or_default(),
                 _ => Vec::new(),
             };
             for k in self.dag.kids(n) {
@@ -451,7 +466,10 @@ impl Elab {
             note(r.clk, None, &mut users);
         }
         let mut seen = HashSet::new();
-        for s in &self.sigs {
+        for (t, s) in self.sigs.iter().enumerate() {
+            if alias.contains_key(&(t as u32)) {
+                continue;
+            }
             for d in &s.drv {
                 if let Drv::Comb(n, _) = d {
                     if seen.insert(*n) {
@@ -471,6 +489,7 @@ impl Elab {
                 }
             }
         }
+        self.mem.alias = alias;
         for m in 0..self.mem.mems.len() {
             self.build_mem(m, &users)?;
         }
@@ -493,8 +512,17 @@ impl Elab {
         }
         let rports: Vec<(Option<(u32, N, bool)>, N, u32)> = mem.r.iter().map(|r| (r.proc, r.addr, r.r)).collect();
         for (proc, addr, r) in rports {
+            // A continuous read loaded whole into one register is that
+            // register's clocked read (`assign t = mem[a]; always_ff q <= en
+            // ? t : q`): the address pin takes `a` itself and `q` is the
+            // RAM's output latch, not flops behind a RAM that absorbed the
+            // address register.
+            let proc = proc.map(|(_, clk, neg)| (clk, neg)).or_else(|| match users.get(&r).map(|u| u.as_slice()) {
+                Some([Some(ri)]) if !self.regs[*ri].negedge && self.load_of(*ri, r, ew).is_some() => Some((self.regs[*ri].clk, false)),
+                _ => None,
+            });
             match proc {
-                Some((_, clk, neg)) => {
+                Some((clk, neg)) => {
                     let us = users.get(&r).cloned().unwrap_or_default();
                     let (q, en) = match us.as_slice() {
                         [Some(ri)] => match self.load_of(*ri, r, ew) {
@@ -809,7 +837,7 @@ impl Elab {
                 return *x;
             }
             let x = match e.dag.op(n).clone() {
-                Op::Read(s) if s == r => Some(e.dag.bit(true)),
+                Op::Read(s) if s == r || e.mem.alias.get(&s) == Some(&r) => Some(e.dag.bit(true)),
                 Op::Read(s) if s == q => Some(e.dag.bit(false)),
                 Op::Mux(c, a, b) => match (en(e, a, r, q, memo), en(e, b, r, q, memo)) {
                     (Some(x), Some(y)) => Some(e.dag.mux(c, x, y)),

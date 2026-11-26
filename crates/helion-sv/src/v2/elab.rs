@@ -1046,7 +1046,8 @@ impl Elab {
                 Dir::Inout => return Err(format!("inout port '{name}' on the top module is not supported")),
             }
         }
-        self.build_mems()?;
+        let keep = fp.iter().filter(|p| p.dir == PortDir::Out).filter_map(|p| p.sig).collect();
+        self.build_mems(&keep)?;
         let sigs = self
             .sigs
             .into_iter()
