@@ -2783,6 +2783,11 @@ mod tests {
 
     fn temp_out_paths(design: &str) -> (String, String) {
         let dir = std::env::temp_dir().join(format!("helion-us09-flow-{design}"));
+        // N69: a prior successful run leaves .bit/.fasm files behind in
+        // this fixed dir, which would poison the absence assertions in
+        // assert_stops_at_route_without_pin_wire_map. Start clean so the
+        // test's precondition holds regardless of earlier runs.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         (
             dir.join(format!("{design}.xcku3p.bit"))
