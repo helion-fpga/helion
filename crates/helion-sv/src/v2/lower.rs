@@ -427,6 +427,11 @@ impl<'a> Blaster<'a> {
                 // A flop that powers up at 1 stores the inverted value.
                 if s.init[bit as usize] { l ^ 1 } else { l }
             }
+            // Never assigned: the variable keeps its initial value (a ROM
+            // from `$readmemh` too small for RAM, G98); without one it reads 0.
+            Drv::None if s.init.iter().any(|&b| b) => {
+                if s.init[bit as usize] { TRUE } else { FALSE }
+            }
             Drv::None => {
                 self.undriven.push(bit_name(&s.name, s.w, bit));
                 FALSE

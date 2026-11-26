@@ -561,7 +561,9 @@ impl Elab {
                 }
                 self.line = *line;
                 if let Err(e) = self.initial(body, sc) {
-                    if e.starts_with(super::mem::RETRY) {
+                    // A memory left without the contents it was given is a wrong
+                    // design, not a simulation detail (G95).
+                    if e.starts_with(super::mem::RETRY) || e.contains("$readmem") {
                         return Err(e);
                     }
                     // Not power-up values: simulation only, as before.

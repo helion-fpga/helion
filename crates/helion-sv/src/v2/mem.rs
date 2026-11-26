@@ -309,8 +309,18 @@ impl Elab {
         if env.mode != Mode::Init {
             return self.err("$readmemh / $readmemb is only supported in an initial block");
         }
-        let (Some(Expr::Str(file)), Some(Expr::Id(path))) = (args.first(), args.get(1)) else {
+        let (Some(fe), Some(Expr::Id(path))) = (args.first(), args.get(1)) else {
             return self.err("$readmem needs a file name and a memory");
+        };
+        // A literal, or a constant string (a parameter, G95).
+        let file = &match fe {
+            Expr::Str(f) => f.clone(),
+            _ => {
+                let v = self.eval_self(fe, sc, &mut super::exec::Env::default())?;
+                let Some(bits) = self.dag.as_const(v.n) else { return self.err("$readmem: the file name is not a constant string") };
+                let bytes: Vec<u8> = bits.chunks(8).rev().map(|c| c.iter().enumerate().fold(0u8, |a, (i, &b)| a | (u8::from(b) << i))).skip_while(|&b| b == 0).collect();
+                String::from_utf8(bytes).map_err(|_| format!("line {}: $readmem: the file name is not a string", self.line))?
+            }
         };
         let super::elab::Sym::Sig(sig) = self.lookup_path(sc, path)? else { return self.err("$readmem needs a memory") };
         let ty = self.sigs[sig as usize].ty.clone();
@@ -505,7 +515,9 @@ impl Elab {
                     }
                 }
                 None => {
-                    // The address must be a register's output.
+                    // The address must be a register's output (seen through
+                    // wires: `assign a10 = a_q[9:0]; ... mem[a10]`).
+                    let addr = self.through_wires(addr);
                     let Some((ri, s)) = self.addr_reg(addr) else {
                         return self.build_lutram(m, users, "a read has no register in front of it (asynchronous read)");
                     };
@@ -554,7 +566,8 @@ impl Elab {
                 let words = if big { 32768 } else { 16384 } / w;
                 let cells = ew.div_ceil(w) * depth.div_ceil(words);
                 let cost = cells * if big { 2 } else { 1 };
-                if best.map(|b| (cost, cells) < (b.0, b.1)).unwrap_or(true) {
+                // On a tie RAMB18s win: the router does not wire RAMB36E1 yet (G11).
+                if best.map(|b| (cost, big, cells) < (b.0, b.2, b.1)).unwrap_or(true) {
                     best = Some((cost, cells, big, w));
                 }
             }
@@ -808,6 +821,27 @@ impl Elab {
             x
         }
         en(self, d, r, q, &mut memo).map(|e| (q, e))
+    }
+
+    /// `n` with every read of a wire that is wholly one node's value
+    /// replaced by that node.
+    fn through_wires(&mut self, n: N) -> N {
+        let mut n = n;
+        for _ in 0..64 {
+            let sigs = &self.sigs;
+            let mut fix = |g: &mut super::dag::Dag, x: N| -> Option<N> {
+                let Op::Read(s) = *g.op(x) else { return None };
+                let drv = &sigs[s as usize].drv;
+                let Some(Drv::Comb(v, 0)) = drv.first() else { return None };
+                (g.w(*v) as usize == drv.len() && drv.iter().enumerate().all(|(i, d)| *d == Drv::Comb(*v, i as u32))).then_some(*v)
+            };
+            let m = self.dag.subst(n, &mut fix, &mut HashMap::new());
+            if m == n {
+                break;
+            }
+            n = m;
+        }
+        n
     }
 
     /// The register whose output an address is built from: (register, signal).

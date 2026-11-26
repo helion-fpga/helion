@@ -214,22 +214,37 @@ impl Dag {
                 flat.push(p);
             }
         }
-        // Merge adjacent constants and adjacent slices of the same node.
-        let mut merged: Vec<N> = Vec::new();
-        for p in flat {
-            if let Some(&last) = merged.last() {
-                if let (Some(a), Some(b)) = (
-                    self.as_const(last).map(|x| x.to_vec()),
-                    self.as_const(p).map(|x| x.to_vec()),
-                ) {
-                    // last is more significant
-                    let mut bits = b;
-                    bits.extend(a);
-                    merged.pop();
-                    let k = self.konst(bits);
-                    merged.push(k);
-                    continue;
+        // Merge each run of adjacent constants once (merging pairwise interned
+        // every prefix: quadratic on a 50,000-entry ROM pattern, G97).
+        let mut runs: Vec<N> = Vec::new();
+        let mut run: Vec<N> = Vec::new();
+        let flush = |d: &mut Self, run: &mut Vec<N>, out: &mut Vec<N>| {
+            match run.len() {
+                0 => {}
+                1 => out.push(run[0]),
+                _ => {
+                    let mut bits = Vec::new();
+                    for &k in run.iter().rev() {
+                        bits.extend_from_slice(d.as_const(k).unwrap()); // least significant first
+                    }
+                    out.push(d.konst(bits));
                 }
+            }
+            run.clear();
+        };
+        for p in flat {
+            if self.as_const(p).is_some() {
+                run.push(p);
+            } else {
+                flush(self, &mut run, &mut runs);
+                runs.push(p);
+            }
+        }
+        flush(self, &mut run, &mut runs);
+        // Merge adjacent slices of the same node.
+        let mut merged: Vec<N> = Vec::new();
+        for p in runs {
+            if let Some(&last) = merged.last() {
                 let la = self.slice_parts(last);
                 let pa = self.slice_parts(p);
                 if let (Some((x, xl, xw)), Some((y, yl, yw))) = (la, pa) {
