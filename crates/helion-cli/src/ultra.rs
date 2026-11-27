@@ -3080,8 +3080,9 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
 
     /// Flow-level test: `helion impl examples/blinky.sv --part xczu3eg`
     /// runs synth to BITGEN and emits a real bitstream. Needs the public
-    /// prjuray-db tileconn root, so it skips (like tileconn_route.rs)
-    /// when HELION_TILECONN_DB_ROOT is unset or absent. Two part
+    /// prjuray-db tileconn root, so it fails loud (N38: the suite total
+    /// must not count this test as passed when it never ran) when
+    /// HELION_TILECONN_DB_ROOT is unset or absent. Two part
     /// directories live under zynqusp (sbva484 and sfvc784), so
     /// HELION_TILECONN_PART must also be set or the router fails loud
     /// on the ambiguous part. Run with:
@@ -3124,25 +3125,28 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
     fn blinky_flow_emits_bitstream_on_xczu3eg() {
         use helion_ultrascale::band_code::{BandCheck, check_stored_band};
         let Ok(db_root) = std::env::var("HELION_TILECONN_DB_ROOT") else {
-            println!(
-                "blinky_flow_emits_bitstream_on_xczu3eg: skipping, \
-                 HELION_TILECONN_DB_ROOT is unset"
+            panic!(
+                "blinky_flow_emits_bitstream_on_xczu3eg: HELION_TILECONN_DB_ROOT is unset; \
+                 the flow test must run, not skip (N38). Run with \
+                 HELION_TILECONN_DB_ROOT=~/workspace/prjuray-db-ref/zynqusp \
+                 HELION_TILECONN_PART=xczu3eg-sbva484-1-e cargo test --release -j1 -p helion-cli \
+                 blinky_flow_emits_bitstream_on_xczu3eg"
             );
-            return;
         };
         if !std::path::Path::new(&db_root).is_dir() {
-            println!(
-                "blinky_flow_emits_bitstream_on_xczu3eg: skipping, \
-                 HELION_TILECONN_DB_ROOT {db_root} is absent"
+            panic!(
+                "blinky_flow_emits_bitstream_on_xczu3eg: HELION_TILECONN_DB_ROOT {db_root} is \
+                 absent; the flow test must run, not skip (N38)"
             );
-            return;
         }
         let Ok(part) = std::env::var("HELION_TILECONN_PART") else {
-            println!(
-                "blinky_flow_emits_bitstream_on_xczu3eg: skipping, \
-                 HELION_TILECONN_PART is unset (zynqusp holds two part dirs)"
+            panic!(
+                "blinky_flow_emits_bitstream_on_xczu3eg: HELION_TILECONN_PART is unset \
+                 (zynqusp holds two part dirs); the flow test must run, not skip (N38). Run with \
+                 HELION_TILECONN_DB_ROOT=~/workspace/prjuray-db-ref/zynqusp \
+                 HELION_TILECONN_PART=xczu3eg-sbva484-1-e cargo test --release -j1 -p helion-cli \
+                 blinky_flow_emits_bitstream_on_xczu3eg"
             );
-            return;
         };
         assert_eq!(
             part, "xczu3eg-sbva484-1-e",
@@ -3245,7 +3249,8 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
 
     /// Flow-level test: `helion impl examples/counter.sv --part xczu3eg`
     /// runs synth to BITGEN and emits a real bitstream. Same tileconn
-    /// env gate as the blinky flow test above; run with:
+    /// env gate as the blinky flow test above (fails loud when the env
+    /// is unset, N38); run with:
     /// HELION_TILECONN_DB_ROOT=~/workspace/prjuray-db-ref/zynqusp
     /// HELION_TILECONN_PART=xczu3eg-sbva484-1-e cargo test --release
     /// -j1 -p helion-cli counter_flow_emits_bitstream_on_xczu3eg
@@ -3268,25 +3273,28 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
     fn counter_flow_emits_bitstream_on_xczu3eg() {
         use helion_ultrascale::band_code::{BandCheck, check_stored_band};
         let Ok(db_root) = std::env::var("HELION_TILECONN_DB_ROOT") else {
-            println!(
-                "counter_flow_emits_bitstream_on_xczu3eg: skipping, \
-                 HELION_TILECONN_DB_ROOT is unset"
+            panic!(
+                "counter_flow_emits_bitstream_on_xczu3eg: HELION_TILECONN_DB_ROOT is unset; \
+                 the flow test must run, not skip (N38). Run with \
+                 HELION_TILECONN_DB_ROOT=~/workspace/prjuray-db-ref/zynqusp \
+                 HELION_TILECONN_PART=xczu3eg-sbva484-1-e cargo test --release -j1 -p helion-cli \
+                 counter_flow_emits_bitstream_on_xczu3eg"
             );
-            return;
         };
         if !std::path::Path::new(&db_root).is_dir() {
-            println!(
-                "counter_flow_emits_bitstream_on_xczu3eg: skipping, \
-                 HELION_TILECONN_DB_ROOT {db_root} is absent"
+            panic!(
+                "counter_flow_emits_bitstream_on_xczu3eg: HELION_TILECONN_DB_ROOT {db_root} is \
+                 absent; the flow test must run, not skip (N38)"
             );
-            return;
         }
         let Ok(part) = std::env::var("HELION_TILECONN_PART") else {
-            println!(
-                "counter_flow_emits_bitstream_on_xczu3eg: skipping, \
-                 HELION_TILECONN_PART is unset (zynqusp holds two part dirs)"
+            panic!(
+                "counter_flow_emits_bitstream_on_xczu3eg: HELION_TILECONN_PART is unset \
+                 (zynqusp holds two part dirs); the flow test must run, not skip (N38). Run with \
+                 HELION_TILECONN_DB_ROOT=~/workspace/prjuray-db-ref/zynqusp \
+                 HELION_TILECONN_PART=xczu3eg-sbva484-1-e cargo test --release -j1 -p helion-cli \
+                 counter_flow_emits_bitstream_on_xczu3eg"
             );
-            return;
         };
         assert_eq!(
             part, "xczu3eg-sbva484-1-e",
