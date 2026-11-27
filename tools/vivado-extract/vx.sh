@@ -38,7 +38,7 @@ submit)
     args=$(printf '%q ' "$@" | sed -e "s#@OUT@#$job/out#g" -e "s#@SRC@#$home/$R/src#g")
     ssh_ "mkdir -p $job/out && cat > $job/run.sbatch" <<EOF
 #!/bin/bash
-#SBATCH -J vx-$name
+#SBATCH -J vx_$name
 #SBATCH -N 1 -n 1 -c ${VX_CPUS:-4}
 #SBATCH --mem=${VX_MEM:-16G}
 #SBATCH -t ${VX_TIME:-04:00:00}
@@ -47,6 +47,7 @@ set -e
 export LC_ALL=C
 $VX_SETUP
 cd $job
+export VX_ARGS="$args"
 vivado -mode batch -nojournal -log $job/vivado.log -source $home/$R/src/tcl/$script -tclargs $args
 EOF
     ssh_ "sbatch $job/run.sbatch"

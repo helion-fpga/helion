@@ -11,6 +11,8 @@ so no device-specific frame-address sequencing is needed.
   bitframes.py selftest
 """
 import gzip
+import json
+import os
 import struct
 import sys
 
@@ -49,7 +51,8 @@ def packets(ws):
 def frames(path):
     """Return (idcode, {far: tuple(words)}) from a debug bitstream."""
     idcode, out, pending = None, {}, None
-    for reg, pay in packets(words(path)):
+    ws = words(path)
+    for reg, pay in packets(ws):
         if reg == REG_IDCODE:
             idcode = pay[0]
         elif reg == REG_FDRI:
@@ -58,8 +61,34 @@ def frames(path):
             out[pay[0]] = pending
             pending = None
     if not out:
-        raise ValueError(f"{path}: no FDRI+LOUT pairs; was DEBUGBITSTREAM set?")
+        part = os.environ.get("BITFRAMES_PART")
+        if not part:
+            raise ValueError(f"{path}: no FDRI+LOUT pairs; set DEBUGBITSTREAM or BITFRAMES_PART=<X-Ray part.json>")
+        out = part_frames(ws, part)
     return idcode, out
+
+
+def far_order(part_json):
+    """7-series FARs in FDRI auto-increment order from an X-Ray part.json, None = row pad frame."""
+    g = json.load(open(part_json))["global_clock_regions"]
+    order = []
+    for blk, bus in ((0, "CLB_IO_CLK"), (1, "BLOCK_RAM")):
+        for half, top in (("top", 0), ("bottom", 1)):
+            for row, rv in sorted(g.get(half, {}).get("rows", {}).items(), key=lambda kv: int(kv[0])):
+                cols = rv["configuration_buses"].get(bus, {}).get("configuration_columns", {})
+                for col, cv in sorted(cols.items(), key=lambda kv: int(kv[0])):
+                    order += [blk << 23 | top << 22 | int(row) << 17 | int(col) << 7 | m for m in range(cv["frame_count"])]
+                order += [None, None]  # two pad frames end every row
+    return order
+
+
+def part_frames(ws, part_json, fw=101):
+    """Frames of a normal (single FDRI burst) 7-series bitstream, addressed via far_order."""
+    data = max((pay for reg, pay in packets(ws) if reg == REG_FDRI), key=len)
+    order = far_order(part_json)
+    if len(data) != len(order) * fw:
+        raise ValueError(f"FDRI has {len(data) // fw} frames, part map {len(order)}: wrong part.json?")
+    return {far: tuple(data[i * fw:(i + 1) * fw]) for i, far in enumerate(order) if far is not None}
 
 
 def is_ultrascale(idcode):

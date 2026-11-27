@@ -7,6 +7,8 @@
 # Every .bit is gzipped; diff them locally with py/bitframes.py diff base.bit.gz <id>.bit.gz.
 # Also writes base.ll (logic location file: FF/LUTRAM/BRAM bit -> FAR, per site),
 # which anchors each site to its frame address.
+# Some hosts' vivado drops -tclargs: vx.sh also exports them as VX_ARGS.
+if {[llength $argv] == 0 && [info exists ::env(VX_ARGS)]} { set argv $::env(VX_ARGS) }
 lassign $argv out part top rtl xdc sweep
 set out [file normalize $out]
 file mkdir $out
@@ -28,7 +30,10 @@ if {[file exists $out/base.dcp]} {
 }
 # Pins in fuzz designs are left unconstrained on purpose.
 set_property SEVERITY Warning [get_drc_checks {NSTD-1 UCIO-1 RTSTAT-10 PDRC-153 LUTLP-1 BIVC-1}]
-set_property BITSTREAM.GENERAL.DEBUGBITSTREAM YES [current_design]
+# 2017.3 on 7-series has no DEBUGBITSTREAM; bitframes.py then maps frames with BITFRAMES_PART.
+if {"BITSTREAM.GENERAL.DEBUGBITSTREAM" in [list_property [current_design]]} {
+    set_property BITSTREAM.GENERAL.DEBUGBITSTREAM YES [current_design]
+}
 set_property BITSTREAM.GENERAL.COMPRESS FALSE [current_design]
 
 proc bit {name} {
