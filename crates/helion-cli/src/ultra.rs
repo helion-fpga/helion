@@ -3201,7 +3201,9 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         }
         // H-1 band: blinky carries no LUTRAM, so the mask is all
         // false. Every frame must check Exact (a Q residual is
-        // accepted by check_stored_band but must not appear here).
+        // accepted by check_stored_band but must not appear here, and
+        // neither may an N16 ambiguous subset: with an all-false mask
+        // there is nothing ambiguous).
         let frames = helion_ultrascale::bitgen::parse_frames(&bytes).unwrap();
         assert_eq!(frames.len(), 14_952);
         let mask = [false; helion_ultrascale::bitgen::FRAME_BITS];
@@ -3210,6 +3212,12 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
             match check_stored_band(*far, words, &mask) {
                 BandCheck::Exact => exact += 1,
                 BandCheck::QResidual => panic!("unexpected Q-residual band at far=0x{far:08x}"),
+                BandCheck::AmbiguousSubset => {
+                    panic!("unexpected ambiguous-subset band at far=0x{far:08x}")
+                }
+                BandCheck::AmbiguousSubsetQResidual => {
+                    panic!("unexpected ambiguous-subset-plus-Q band at far=0x{far:08x}")
+                }
                 BandCheck::Mismatch { stored, expected } => panic!(
                     "band mismatch far=0x{far:08x} stored=0x{stored:012x} \
                      expected=0x{expected:012x}"
@@ -3350,7 +3358,9 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
         }
         assert!(pips > 0, "flow FASM carries no PIPs");
         // H-1 band: the counter carries no LUTRAM, so the mask is
-        // all false, as in the blinky flow test.
+        // all false, as in the blinky flow test. Every frame must
+        // check Exact: no Q residual and no N16 ambiguous subset may
+        // appear with an all-false mask.
         let frames = helion_ultrascale::bitgen::parse_frames(&bytes).unwrap();
         assert_eq!(frames.len(), 14_952);
         let mask = [false; helion_ultrascale::bitgen::FRAME_BITS];
@@ -3359,6 +3369,12 @@ INT_X1Y0.PIP.BOUNCE_W_0_FT1.INODE_W_1_FT1\n";
             match check_stored_band(*far, words, &mask) {
                 BandCheck::Exact => exact += 1,
                 BandCheck::QResidual => panic!("unexpected Q-residual band at far=0x{far:08x}"),
+                BandCheck::AmbiguousSubset => {
+                    panic!("unexpected ambiguous-subset band at far=0x{far:08x}")
+                }
+                BandCheck::AmbiguousSubsetQResidual => {
+                    panic!("unexpected ambiguous-subset-plus-Q band at far=0x{far:08x}")
+                }
                 BandCheck::Mismatch { stored, expected } => panic!(
                     "band mismatch far=0x{far:08x} stored=0x{stored:012x} \
                      expected=0x{expected:012x}"

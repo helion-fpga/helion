@@ -2781,11 +2781,14 @@ pub fn parse_bitstream(
     // formula with the LUTRAM masks derived above. A stored band
     // equal to the masked formula, or to the formula XOR the Q
     // residual w (the 484 Q frames carry formula + w, see
-    // `band_code`), passes; anything else fails loud with the named
-    // `BandMismatch` error. Block-1 frames expect a zero band, also
-    // checked here. This runs before the unexplained-bits check so a
-    // wrong band reports `BandMismatch` even when the frame also
-    // carries unexplained bits.
+    // `band_code`), passes; N16 also passes a stored band that
+    // differs from the masked formula by a subset of the ambiguous
+    // masked columns when their rank is at most
+    // `MAX_AMBIGUOUS_RANK`, with or without w. Anything else fails
+    // loud with the named `BandMismatch` error. Block-1 frames expect
+    // a zero band, also checked here. This runs before the
+    // unexplained-bits check so a wrong band reports `BandMismatch`
+    // even when the frame also carries unexplained bits.
     for (far, words) in &frames {
         let (block, _, _, _) = far_decode(*far);
         if block > 1 {

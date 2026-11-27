@@ -175,7 +175,12 @@ pub fn write_computed_band(
 /// Outcome of checking one stored band against the formula. This is
 /// the parse-side verdict (N7): the stored band must equal the masked
 /// MAP-A value, or that value XOR the Q residual, and anything else is
-/// a named mismatch, never a silent accept.
+/// a named mismatch, never a silent accept. N16 adds the two
+/// `AmbiguousSubset` variants below: a stored band that differs from
+/// the masked value by a subset of the ambiguous masked columns is
+/// accepted when that column set is small (rank at most
+/// `MAX_AMBIGUOUS_RANK`), because parse cannot tell RAM content bits
+/// from logic INIT bits in a mixed column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BandCheck {
     /// Stored band equals the expected value.
@@ -183,10 +188,98 @@ pub enum BandCheck {
     /// Stored band equals the expected value XOR `Q_RESIDUAL`: a Q
     /// frame, accepted, not explained.
     QResidual,
+    /// Stored band equals the expected value XOR the XOR of some
+    /// subset of the ambiguous masked columns: the masked set bits
+    /// whose MAP-A columns have GF(2) rank at most
+    /// `MAX_AMBIGUOUS_RANK`. Accepted, not explained: the subset is
+    /// the logic INIT bits among the masked positions, which parse
+    /// cannot identify from bits alone.
+    AmbiguousSubset,
+    /// As `AmbiguousSubset`, plus the Q residual: the stored band
+    /// equals the expected value XOR `Q_RESIDUAL` XOR a subset of
+    /// the ambiguous masked columns. A frame that is both a Q frame
+    /// and mixed-column.
+    AmbiguousSubsetQResidual,
     /// Stored band matches neither the expected value nor the expected
     /// value XOR `Q_RESIDUAL`. `expected` is the masked MAP-A value
     /// for block-0 frames and 0 for block-1 and block-2+ frames.
     Mismatch { stored: u64, expected: u64 },
+}
+
+/// Maximum GF(2) rank of the ambiguous masked-column set for which
+/// N16 subset acceptance applies.
+///
+/// Measured on the 14-design Vivado corpus (144,816 block-0 frames,
+/// `~/workspace/ultra-bitgen-crew/logs/n16fix_measure3.py`): 5,584
+/// frames sit in a RAM-letter column and 3,948 of those carry at
+/// least one ambiguous masked set bit. Their per-bit column rank is
+/// 40 to 44 on 3,798 frames, so no bound anywhere near the full rank
+/// is honest: the whole MAP-A table spans only a 44-dimensional
+/// subspace of the 48-bit band, and at rank 44 a random wrong band
+/// lands in the span with probability 1 in 16. At rank 24 the
+/// accepted set holds at most 2^24 deltas (2^25 with the Q-combined
+/// variant), so a uniformly random wrong band passes with
+/// probability at most 1 in 8,388,608; over the whole 144,816-frame
+/// corpus that is under 0.02 expected slips. The acceptance ladder
+/// on real ambiguous frames is 5 frames at rank 16, 20 at rank 24,
+/// 36 at rank 32, so 24 is the largest bound that keeps the
+/// corpus-scale slip expectation below 0.02 while accepting four
+/// times the frames rank 16 does. Dense real mixed columns
+/// (rank 40 to 44 on 3,863 frames) still fail loud; that residual is
+/// the documented
+/// N16 remainder, not a silent accept. A group-aware variant (the
+/// true subset is a union of (slice, letter) groups, measured rank
+/// 24 or below on 801 real frames) would accept more, but
+/// `check_stored_band` receives no grouping input, so it stays
+/// future work.
+pub const MAX_AMBIGUOUS_RANK: usize = 24;
+
+/// Insert `value` into a GF(2) basis keyed by highest set bit.
+/// Returns true when the value was independent (rank grows by one).
+/// Basis slots hold 0 when absent; a basis vector is never 0.
+fn basis_insert(basis: &mut [u64; BAND_BITS], mut value: u64) -> bool {
+    while value != 0 {
+        let pivot = 63 - value.leading_zeros() as usize;
+        if basis[pivot] == 0 {
+            basis[pivot] = value;
+            return true;
+        }
+        value ^= basis[pivot];
+    }
+    false
+}
+
+/// Reduce `value` by a GF(2) basis keyed by highest set bit.
+/// Returns the remainder; zero means the value is in the span.
+fn basis_reduce(basis: &[u64; BAND_BITS], mut value: u64) -> u64 {
+    while value != 0 {
+        let pivot = 63 - value.leading_zeros() as usize;
+        if basis[pivot] == 0 {
+            break;
+        }
+        value ^= basis[pivot];
+    }
+    value
+}
+
+/// The MAP-A columns of the ambiguous masked set bits of one frame:
+/// positions that are both masked (LUTRAM per parse) and set in the
+/// frame, outside the band range, with a nonzero column. Band bits
+/// are never inputs, matching `compute_band_map_a`.
+fn ambiguous_columns(words: &FrameWords, lutram_mask: &[bool; FRAME_BITS]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for &(src, col) in tables::MAP_A {
+        if src >= BAND_LO && src <= BAND_HI {
+            continue;
+        }
+        if col == 0 {
+            continue;
+        }
+        if lutram_mask[src as usize] && bit_is_set(words, src) {
+            out.push(col & BAND_MASK);
+        }
+    }
+    out
 }
 
 /// Check one stored band against the masked MAP-A formula. This is the
@@ -197,6 +290,19 @@ pub enum BandCheck {
 /// - Block type 0: expected is `compute_band_map_a` with the LUTRAM
 ///   mask; accept the stored band when it equals the expected value,
 ///   or the expected value XOR `Q_RESIDUAL` (the 484 Q frames).
+/// - N16: when neither holds, the difference may still be explained
+///   by the mixed-column ambiguity: every masked set bit may be RAM
+///   content (excluded) or logic INIT (included), so the stored band
+///   may equal the expected value XOR any subset of the ambiguous
+///   masked columns. That subset is found by Gaussian elimination
+///   over the 48-bit column vectors, never by enumerating subsets
+///   and never by the two extremes (masked vs unmasked), which the
+///   pinned test disproves: the stored band there is one column
+///   alone, neither extreme. Subset acceptance applies only when
+///   the ambiguous columns have GF(2) rank at most
+///   `MAX_AMBIGUOUS_RANK`; above it the check fails loud exactly as
+///   before, so dense mixed columns stay rejected. The same subset
+///   XOR the Q residual is accepted as its own variant.
 /// - Block type 1 (BRAM content) and block types 2 and above: the
 ///   expected band is 0, matching `compute_band`; any nonzero stored
 ///   band is a mismatch. Block types 2 and above are untested and
@@ -213,12 +319,36 @@ pub fn check_stored_band(
         _ => 0,
     };
     if stored == expected {
-        BandCheck::Exact
-    } else if block == 0 && stored == (expected ^ Q_RESIDUAL) {
-        BandCheck::QResidual
-    } else {
-        BandCheck::Mismatch { stored, expected }
+        return BandCheck::Exact;
     }
+    if block == 0 && stored == (expected ^ Q_RESIDUAL) {
+        return BandCheck::QResidual;
+    }
+    if block != 0 {
+        return BandCheck::Mismatch { stored, expected };
+    }
+    let columns = ambiguous_columns(words, lutram_mask);
+    if columns.is_empty() {
+        return BandCheck::Mismatch { stored, expected };
+    }
+    let mut basis = [0u64; BAND_BITS];
+    let mut rank = 0usize;
+    for col in &columns {
+        if basis_insert(&mut basis, *col) {
+            rank += 1;
+        }
+    }
+    if rank > MAX_AMBIGUOUS_RANK {
+        return BandCheck::Mismatch { stored, expected };
+    }
+    let delta = (stored ^ expected) & BAND_MASK;
+    if basis_reduce(&basis, delta) == 0 {
+        return BandCheck::AmbiguousSubset;
+    }
+    if basis_reduce(&basis, delta ^ Q_RESIDUAL) == 0 {
+        return BandCheck::AmbiguousSubsetQResidual;
+    }
+    BandCheck::Mismatch { stored, expected }
 }
 
 #[cfg(test)]
@@ -409,8 +539,13 @@ mod tests {
                 expected
             }
         );
-        // A masked content bit contributes nothing: the stored band
-        // must be 0, and a stored column value is a mismatch.
+        // A masked content bit contributes nothing on its own: the
+        // stored band must be 0 for Exact. N16 changed what a stored
+        // column value means here: the single masked set bit is
+        // ambiguous (it may be a logic INIT bit), its column has
+        // rank 1, so the stored column is accepted as
+        // AmbiguousSubset, not a mismatch. A corrupted value is
+        // still a mismatch; see the dedicated N16 tests below.
         let mut mask = no_mask();
         mask[0] = true;
         assert_eq!(
@@ -422,10 +557,7 @@ mod tests {
         write_band(&mut unmasked_band, expected);
         assert_eq!(
             check_stored_band(far_encode(0, 0, 0, 0).unwrap(), &unmasked_band, &mask),
-            BandCheck::Mismatch {
-                stored: expected,
-                expected: 0
-            }
+            BandCheck::AmbiguousSubset
         );
         // Block-1 frames expect a zero band with no Q allowance: a
         // stored w is a mismatch, not a QResidual.
@@ -442,6 +574,132 @@ mod tests {
         assert_eq!(
             check_stored_band(far_encode(1, 0, 0, 0).unwrap(), &bram_zero, &no_mask()),
             BandCheck::Exact
+        );
+    }
+
+    fn words_with_bits(bits: &[u16]) -> FrameWords {
+        let mut words = empty_words();
+        for &abs in bits {
+            words[(abs / 32) as usize] |= 1u32 << (abs % 32);
+        }
+        words
+    }
+
+    fn mask_for_bits(bits: &[u16]) -> [bool; FRAME_BITS] {
+        let mut mask = no_mask();
+        for &abs in bits {
+            mask[abs as usize] = true;
+        }
+        mask
+    }
+
+    #[test]
+    fn check_stored_band_accepts_ambiguous_subsets() {
+        // N16 pinned numbers, confirmed against
+        // h1_ecc_sparse_maps.json key "A": col(15) is the Y0 INIT
+        // bit, col(975) the Y20 INIT bit on FAR minor 11.
+        let col15 = compute_band_map_a(&single_bit_words(15), &no_mask());
+        let col975 = compute_band_map_a(&single_bit_words(975), &no_mask());
+        assert_eq!(col15, 0x880800088088);
+        assert_eq!(col975, 0x088000008088);
+        assert_eq!(col15 ^ col975, 0x808800080000);
+        // Two masked set bits, both ambiguous: the masked
+        // prediction is 0, and every subset of the two columns is
+        // accepted, including the single-column stored band the
+        // two-extremes rule misses.
+        let far = far_encode(0, 0, 0, 0).unwrap();
+        let words = words_with_bits(&[15, 975]);
+        let mask = mask_for_bits(&[15, 975]);
+        for stored in [0, col15, col975, col15 ^ col975] {
+            let mut frame = words;
+            write_band(&mut frame, stored);
+            let got = check_stored_band(far, &frame, &mask);
+            let want = if stored == 0 {
+                BandCheck::Exact
+            } else {
+                BandCheck::AmbiguousSubset
+            };
+            assert_eq!(got, want, "stored 0x{stored:012x}");
+        }
+        // The same subset plus the Q residual is its own variant,
+        // while the bare residual with no subset stays QResidual.
+        let mut frame_q = words;
+        write_band(&mut frame_q, col975 ^ Q_RESIDUAL);
+        assert_eq!(
+            check_stored_band(far, &frame_q, &mask),
+            BandCheck::AmbiguousSubsetQResidual
+        );
+        let mut frame_q_only = words;
+        write_band(&mut frame_q_only, Q_RESIDUAL);
+        assert_eq!(
+            check_stored_band(far, &frame_q_only, &mask),
+            BandCheck::QResidual
+        );
+    }
+
+    #[test]
+    fn check_stored_band_rejects_corrupted_band_under_ambiguity() {
+        // Same two-bit ambiguous frame: a stored band one bit off
+        // any subset XOR is a mismatch, not an accept. The span
+        // holds 4 values; col(975) with one band bit flipped and an
+        // unrelated value are both outside it, with and without Q.
+        let far = far_encode(0, 0, 0, 0).unwrap();
+        let words = words_with_bits(&[15, 975]);
+        let mask = mask_for_bits(&[15, 975]);
+        let col975 = compute_band_map_a(&single_bit_words(975), &no_mask());
+        for stored in [col975 ^ 1, 0x123456789abc, col975 ^ Q_RESIDUAL ^ 1] {
+            let mut frame = words;
+            write_band(&mut frame, stored);
+            assert_eq!(
+                check_stored_band(far, &frame, &mask),
+                BandCheck::Mismatch {
+                    stored,
+                    expected: 0
+                },
+                "stored 0x{stored:012x} must fail loud"
+            );
+        }
+    }
+
+    #[test]
+    fn check_stored_band_rejects_over_bound_ambiguous_set() {
+        // Sources 0..96 carry 97 masked set bits whose columns have
+        // GF(2) rank 25 (first prefix of band_code_tables.rs MAP_A
+        // to reach rank 25), one above MAX_AMBIGUOUS_RANK. A stored
+        // band that IS a subset XOR of those columns must still fail
+        // loud: the bound, not the value, decides.
+        let far = far_encode(0, 0, 0, 0).unwrap();
+        let bits: Vec<u16> = (0..97).collect();
+        let words = words_with_bits(&bits);
+        let mask = mask_for_bits(&bits);
+        let subset = compute_band_map_a(&words_with_bits(&[0, 1, 2]), &no_mask());
+        let mut frame = words;
+        write_band(&mut frame, subset);
+        assert_eq!(
+            check_stored_band(far, &frame, &mask),
+            BandCheck::Mismatch {
+                stored: subset,
+                expected: 0
+            }
+        );
+        let mut frame_q = words;
+        write_band(&mut frame_q, subset ^ Q_RESIDUAL);
+        assert_eq!(
+            check_stored_band(far, &frame_q, &mask),
+            BandCheck::Mismatch {
+                stored: subset ^ Q_RESIDUAL,
+                expected: 0
+            }
+        );
+        // The same stored band with only the three subset bits
+        // masked (rank 3) is accepted: same value, small set.
+        let small_words = words_with_bits(&[0, 1, 2]);
+        let small_mask = mask_for_bits(&[0, 1, 2]);
+        let mut small_frame = small_words;
+        write_band(&mut small_frame, subset);
+        assert_eq!(
+            check_stored_band(far, &small_frame, &small_mask),
+            BandCheck::AmbiguousSubset
         );
     }
 

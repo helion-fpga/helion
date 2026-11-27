@@ -120,6 +120,8 @@ fn main() -> Result<(), String> {
     let mut map_a_exact = 0usize;
     let mut map_a_w = 0usize;
     let mut map_a_other = 0usize;
+    let mut map_a_amb = 0usize;
+    let mut map_a_amb_q = 0usize;
     let mut h76_exact = 0usize;
     let mut h76_w = 0usize;
     let mut h76_other = 0usize;
@@ -150,8 +152,11 @@ fn main() -> Result<(), String> {
                     let mask = masks.get(far).unwrap_or(&empty_mask);
                     // The same check `parse_bitstream` runs (N7):
                     // Exact counts as MAP-A exact, QResidual as the
-                    // w residual, Mismatch as other. H76 below stays
-                    // an independent cross-check, not this function.
+                    // w residual, Mismatch as other. The N16 subset
+                    // variants are counted separately: under the
+                    // true per-slice masks they must stay 0, since a
+                    // true mask leaves no ambiguity (a nonzero D
+                    // there would mean the mask itself is wrong).
                     match check_stored_band(*far, words, mask) {
                         BandCheck::Exact => {
                             map_a_exact += 1;
@@ -159,6 +164,12 @@ fn main() -> Result<(), String> {
                         }
                         BandCheck::QResidual => {
                             map_a_w += 1;
+                        }
+                        BandCheck::AmbiguousSubset => {
+                            map_a_amb += 1;
+                        }
+                        BandCheck::AmbiguousSubsetQResidual => {
+                            map_a_amb_q += 1;
                         }
                         BandCheck::Mismatch { .. } => {
                             map_a_other += 1;
@@ -193,6 +204,8 @@ fn main() -> Result<(), String> {
     println!("MAP-A masked exact: {map_a_exact}");
     println!("MAP-A residual w (0xf0000000000f): {map_a_w}");
     println!("MAP-A residual other: {map_a_other}");
+    println!("MAP-A ambiguous subset (N16): {map_a_amb}");
+    println!("MAP-A ambiguous subset plus w (N16): {map_a_amb_q}");
     println!("H76 exact: {h76_exact}");
     println!("H76 residual w: {h76_w}");
     println!("H76 residual other: {h76_other}");

@@ -49,6 +49,8 @@ fn corpus_sample_reproduces_python_counts() {
     let mut h76_exact = 0usize;
     let mut q = 0usize;
     let mut other = 0usize;
+    let mut amb = 0usize;
+    let mut amb_q = 0usize;
     let mut b1 = 0usize;
     for _ in 0..n {
         let far = read_u32(&bytes, &mut off);
@@ -80,10 +82,16 @@ fn corpus_sample_reproduces_python_counts() {
                 b0 += 1;
                 // The same check `parse_bitstream` runs (N7): Exact
                 // counts as MAP-A exact, QResidual as the w residual,
-                // Mismatch as other.
+                // Mismatch as other. The N16 subset variants are
+                // counted separately and must stay 0: the fixture
+                // masks are the true per-slice masks, which leave no
+                // ambiguity, so a nonzero subset count would mean a
+                // mask in the fixture is wrong.
                 match check_stored_band(far, &words, &mask) {
                     BandCheck::Exact => map_a_exact += 1,
                     BandCheck::QResidual => q += 1,
+                    BandCheck::AmbiguousSubset => amb += 1,
+                    BandCheck::AmbiguousSubsetQResidual => amb_q += 1,
                     BandCheck::Mismatch { .. } => other += 1,
                 }
                 if compute_band_h76(&words) == stored {
@@ -118,6 +126,8 @@ fn corpus_sample_reproduces_python_counts() {
     assert_eq!(h76_exact, 155);
     assert_eq!(q, 20);
     assert_eq!(other, 0, "no MAP-A residual other than w");
+    assert_eq!(amb, 0, "no ambiguous-subset band under true masks");
+    assert_eq!(amb_q, 0, "no ambiguous-subset-plus-Q band under true masks");
     assert_eq!(b1, 20);
 }
 

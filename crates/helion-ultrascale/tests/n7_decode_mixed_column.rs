@@ -109,16 +109,57 @@ fn mixed_column_ram_plus_logic_decodes_clean() {
 }
 
 /// Same frames, but the 0x60b band is stored unmasked (both INIT
-/// columns). The decoder masks the Y0 INIT bit, expects only the Y20
-/// column, and must fail loud with BandMismatch naming FAR 0x60b.
-/// This pins that the decoder actually applies the mask: without it
-/// the unmasked band would be accepted.
+/// columns). Under the N16 per-bit-subset acceptance this now decodes
+/// clean, and that is intended, not a silent error: the decoder masks
+/// the Y0 INIT bit, expects only the Y20 column, and the stored band
+/// differs from that expectation by exactly col(15), the column of
+/// the one masked set bit, rank 1, inside the bound of 24. The
+/// decoded FASM is correct and complete, both INIT lines and MODE.RAM
+/// on the Y0 tile only, with zero unexplained bits, identical to the
+/// masked case above. The old fail-loud expectation was the N16
+/// false-reject behavior on the decode side; the corrupted-band test
+/// below is now the pin that the band check still fails loud.
 #[test]
-fn mixed_column_with_unmasked_band_fails_loud() {
+fn mixed_column_with_unmasked_band_decodes_clean() {
     let dir = fixture_dir("mixed-unmasked");
     let frames = vec![
         frame_with_band(0x609, &[19], &[false; FRAME_BITS]),
         frame_with_band(0x60b, &[15, 975], &[false; FRAME_BITS]),
+    ];
+    let out = decode_frames(&frames, dir.to_str().unwrap()).unwrap();
+    assert_eq!(
+        out.fasm,
+        vec![
+            "SLICE_X0Y0.A6LUT.INIT[63:0] = 0x1".to_string(),
+            "SLICE_X0Y0.ALUT.MODE.RAM".to_string(),
+            "SLICE_X0Y20.A6LUT.INIT[63:0] = 0x1".to_string(),
+        ]
+    );
+    assert!(
+        out.unexplained.is_empty(),
+        "unexplained: {:?}",
+        out.unexplained
+    );
+}
+
+/// Same frames, but the 0x60b stored band is corrupted by one bit off
+/// any subset XOR: the band is computed with only the Y0 INIT bit
+/// masked (expected col(975), ambiguous subset XORs col(975) and
+/// col(975)^col(15)), then band bit 0 is flipped, so the stored band
+/// is col(975)^1. That delta is in no subset span, with or without Q,
+/// so decode must still fail loud with BandMismatch naming FAR 0x60b.
+/// This pins that the N16 acceptance is a bounded subset check, not
+/// a blanket accept of any band on a masked frame.
+#[test]
+fn mixed_column_with_corrupted_band_fails_loud() {
+    let dir = fixture_dir("mixed-corrupted");
+    let mut mask_60b = [false; FRAME_BITS];
+    mask_60b[15] = true;
+    let mut frame_60b = frame_with_band(0x60b, &[15, 975], &mask_60b);
+    frame_60b.words[45] ^= 1;
+    let frames = vec![
+        frame_with_band(0x609, &[19], &[false; FRAME_BITS]),
+        frame_60b,
     ];
     let err = decode_frames(&frames, dir.to_str().unwrap()).unwrap_err();
     assert!(err.contains("BandMismatch"), "err: {err}");

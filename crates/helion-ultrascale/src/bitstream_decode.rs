@@ -114,10 +114,11 @@
 //! loop by the tiles carrying a present `{L}LUT.MODE.RAM` line, the
 //! same identifiers (`ram_mode_lut_index`, `lut_init_index`) and the
 //! same filter order as `parse_bitstream`. A frame whose check is
-//! Exact or QResidual has its band bits explained, never listed in
-//! `unexplained`; a Mismatch fails loud with a `BandMismatch` error
-//! naming the FAR, stored and expected band. Block-2+ frames are not
-//! checked: their band bits stay unexplained, as before.
+//! Exact, QResidual, or one of the N16 ambiguous-subset variants has
+//! its band bits explained, never listed in `unexplained`; a Mismatch
+//! fails loud with a `BandMismatch` error naming the FAR, stored and
+//! expected band. Block-2+ frames are not checked: their band bits
+//! stay unexplained, as before.
 //!
 //! The mask derivation resolves MODE.RAM per slice tile (each tile
 //! owns its own bit window), and real Vivado frames carry the
@@ -402,12 +403,14 @@ pub fn decode_frames(frames: &[Frame], db_root: &str) -> Result<DecodeOutput, St
         };
         // N7 band check: the band (absolute bits 1440-1487) is a
         // computed code, not a feature. A frame whose stored band
-        // matches the masked MAP-A formula (Exact) or the formula XOR
-        // the Q residual (QResidual) has its band bits explained;
-        // anything else fails loud here, before the unexplained-bits
-        // check, exactly as `parse_bitstream` does. Block-1 frames
-        // expect a zero band, also checked here. Block-2+ frames are
-        // not checked: their band bits stay unexplained, as before.
+        // matches the masked MAP-A formula (Exact), the formula XOR
+        // the Q residual (QResidual), or the formula plus a small
+        // ambiguous subset (N16, see `band_code`) has its band bits
+        // explained; anything else fails loud here, before the
+        // unexplained-bits check, exactly as `parse_bitstream` does.
+        // Block-1 frames expect a zero band, also checked here.
+        // Block-2+ frames are not checked: their band bits stay
+        // unexplained, as before.
         let (block, _, _, _) = far_decode(*far);
         if block <= 1 {
             let empty_mask = [false; crate::bitgen::FRAME_BITS];
