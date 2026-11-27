@@ -421,6 +421,18 @@ sweep_fingerprint_orphans() {
   fi
   local tmp
   tmp="$(mktemp -d)"
+  # N80: remove the tmp dir even if the sweep is killed mid-run
+  # (SIGTERM): without a trap the 3 hash files leak under /tmp. The
+  # trap is cleared on every return path so it never fires outside
+  # this function and never disturbs a caller's own traps. SIGINT is
+  # deliberately NOT trapped: a non-interactive bash without job
+  # control ignores SIGINT, so an INT trap can never fire here
+  # (proven by repro: SIGTERM fires the trap, SIGINT is swallowed and
+  # the script runs to completion). No EXIT trap is set here on
+  # purpose: it would replace a caller's EXIT trap (the synthetic
+  # prune test relies on its own). SIGKILL and power loss still leak
+  # by necessity; no trap can cover those.
+  trap 'rm -rf -- "$tmp"; exit 143' TERM
   local deps_hashes="$tmp/deps.hashes"
   local build_hashes="$tmp/build.hashes"
   local ex_hashes="$tmp/examples.hashes"
@@ -452,12 +464,13 @@ sweep_fingerprint_orphans() {
       build-script|run-build-script|example|-) continue ;;
     esac
     bytes="$(du -sb "$dir" | cut -f1)"
-    rm -rf -- "$dir" || { echo "ERROR: orphan sweep failed to delete $dir" >&2; rm -rf "$tmp"; return 1; }
+    rm -rf -- "$dir" || { echo "ERROR: orphan sweep failed to delete $dir" >&2; rm -rf "$tmp"; trap - TERM; return 1; }
     echo "$name $kind" >> "$list"
     deleted=$((deleted + 1))
     freed=$((freed + bytes))
   done
   rm -rf "$tmp"
+  trap - TERM
   echo "orphan-sweep: $profile_dir: fingerprint dirs deleted $deleted, bytes freed $freed" | tee -a "$SUMMARY"
   return 0
 }
