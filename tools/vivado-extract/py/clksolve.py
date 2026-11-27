@@ -26,7 +26,10 @@ ECC_WORD, ECC_BITS = 50, 13  # 7-series frame ECC: word 50 bits 0-12
 def pip_tag(name):
     """'HCLK_CMT_X8Y26/HCLK_CMT.SRC->>DST' -> ('HCLK_CMT', 'HCLK_CMT.DST.SRC')."""
     m = re.match(r"[^/]+/([^.]+)\.(\S+?)(<<->>|->>|->)(\S+)$", name)
-    return (m[1], f"{m[1]}.{m[4]}.{m[2]}") if m else (None, None)
+    # shortcut: a bidirectional pip's name does not say which way the net used it, so it is
+    # skipped (only CLK_BUFG_REBUF GCLK TOP/BOT on 7-series, which X-Ray already has); read
+    # the direction from the net's ROUTE property if one ever needs solving.
+    return (m[1], f"{m[1]}.{m[4]}.{m[2]}") if m and m[3] != "<<->>" else (None, None)
 
 
 def tile_bits(frames, b):
@@ -81,7 +84,8 @@ def solve(samples, min_on=1):
                 continue
             cand = set.intersection(*on) - always
             off_hits = sum(1 for b, t in ss if tag not in t and cand <= b) if cand else 0
-            status = "NOBITS" if not cand else ("CONFLICT" if off_hits else "OK")
+            # A pip used in every sample shares the "always" bits; it cannot be separated yet.
+            status = "UNSEPARABLE" if len(on) == len(ss) else "NOBITS" if not cand else ("CONFLICT" if off_hits else "OK")
             res.append((ty, tag, len(on), status, cand))
     return res
 
@@ -126,6 +130,7 @@ def selftest():
     assert got and not bad, bad
     assert pip_tag("HCLK_CMT_X8Y26/HCLK_CMT.HCLK_CMT_CK_IN0->>HCLK_CMT_MUX_CLK_0") == (
         "HCLK_CMT", "HCLK_CMT.HCLK_CMT_MUX_CLK_0.HCLK_CMT_CK_IN0")
+    assert pip_tag("T_X1Y1/T.A<<->>B") == (None, None)
     print(f"selftest ok: {len(got)} of {len(truth)} pips solved exactly")
 
 

@@ -6,7 +6,8 @@
 
 For every <id>.bit.gz next to base.bit.gz (ids and props from fuzz.log), prints
   id  props  changed fields (FIELD=base->var, multi-bit fields as integers)  unexplained bits
-where unexplained = tile-relative bits that differ from base and appear in no segbits entry.
+where unexplained = tile-relative bits that differ from base, appear in no segbits entry and
+sit in no word another tile (e.g. the CMT's INT_R) also covers; those are only counted.
 """
 import json
 import os
@@ -60,19 +61,28 @@ def main():
     types = set((a[a.index("--types") + 1] if "--types" in a else TYPES).split(","))
     tiles = {k: v for k, v in grid.items() if v["type"] in types and "CLB_IO_CLK" in v.get("bits", {})}
     dbs = {ty: load_db(dbdir, ty) for ty in types}
+    # Words a tracked tile shares with another tile (e.g. CMT and its INT_R): their bits
+    # belong to that tile's own segbits, so they are counted apart, not as unexplained.
+    segs = [(t, int(x["baseaddr"], 16), x["frames"], x["offset"], x["words"]) for t, tv in grid.items() for x in tv.get("bits", {}).values()]
+    shared = {}
+    for t, v in tiles.items():
+        b = v["bits"]["CLB_IO_CLK"]
+        base, off = int(b["baseaddr"], 16), b["offset"]
+        shared[t] = {(m, w - off) for m in range(b["frames"]) for w in range(off, off + b["words"])
+                     if any(o != t and ba <= base + m < ba + n and oo <= w < oo + nw for o, ba, n, oo, nw in segs)}
 
     def tiles_of(path):
         _, fr = bitframes.frames(path)
         return {t: tile_bits(fr, v["bits"]["CLB_IO_CLK"]) for t, v in tiles.items()}
 
     base = tiles_of(os.path.join(d, "base.bit.gz"))
-    print("id\tprops\tchanged\tunexplained")
+    print("id\tprops\tchanged\tunexplained\tbits in words shared with other tiles")
     for line in open(os.path.join(d, "fuzz.log")):
         f = line.rstrip("\n").split("\t")
         bit = os.path.join(d, f"{f[0]}.bit.gz")
         if len(f) < 2 or f[1] != "OK" or not os.path.exists(bit):
             continue
-        var, changed, unexpl = tiles_of(bit), [], []
+        var, changed, unexpl, nshared = tiles_of(bit), [], [], []
         for t, vb in var.items():
             bb = base[t]
             if vb == bb:
@@ -80,8 +90,10 @@ def main():
             fields, known = dbs[grid[t]["type"]]
             db, dv = decode(bb, fields), decode(vb, fields)
             changed += [f"{t}:{n.split('.', 1)[1]}={db[n]}->{dv[n]}" for n in sorted(dv) if dv[n] != db[n]]
-            unexpl += [f"{t}:{b}" for b in sorted((vb ^ bb) - known)]
-        print(f"{f[0]}\t{' '.join(f[2:])}\t{' '.join(changed)}\t{' '.join(unexpl)}")
+            for b in sorted((vb ^ bb) - known):
+                m, bi = map(int, b.split("_"))
+                (nshared.append if (m, bi // 32) in shared[t] else unexpl.append)(f"{t}:{b}")
+        print(f"{f[0]}\t{' '.join(f[2:])}\t{' '.join(changed)}\t{' '.join(unexpl)}\t{len(nshared)}")
 
 
 if __name__ == "__main__":
