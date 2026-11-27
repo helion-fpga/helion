@@ -149,9 +149,22 @@ artifact_version() {
 # known-empty features); an unreadable or malformed JSON prints "-".
 # Extracted with python3 reading the JSON, not by hand-parsing fourth
 # values with grep: the array is one line and the entries are
-# positional. Prints "-" on any failure.
+# positional. Prints "-" on any failure. N79: when DEPS_CLOSURE_CACHE
+# names a precomputed cache file (set by prune_target), the closure is
+# read from it with one grep instead of spawning python3; a cache miss
+# falls back to the python3 computation, so standalone callers (which
+# never set the variable) behave exactly as before. Cache lines are
+# "<json-path>\t<closure>", one per unit JSON, keyed by absolute path.
 artifact_deps_closure() {
   local json="$1"
+  if [ -n "${DEPS_CLOSURE_CACHE:-}" ] && [ -f "$DEPS_CLOSURE_CACHE" ]; then
+    local hit
+    hit="$(grep -F -m1 -- "$json"$'\t' "$DEPS_CLOSURE_CACHE" 2>/dev/null || true)"
+    if [ -n "$hit" ]; then
+      printf '%s' "${hit#*$'\t'}"
+      return 0
+    fi
+  fi
   local out
   out="$(python3 -c 'import json,sys
 try:
@@ -162,6 +175,32 @@ except Exception:
     sys.exit(1)' "$json" 2>/dev/null)" || { printf '%s' "-"; return 0; }
   [ -n "$out" ] || out="-"
   printf '%s' "$out"
+}
+
+# Precompute the deps closure for every unit JSON under one
+# fingerprint dir into the cache file named by DEPS_CLOSURE_CACHE
+# (N79): one python3 process for all JSONs instead of one per
+# (crate, hash) row. Lines are "<json-path>\t<closure>" with the exact
+# same closure expression as artifact_deps_closure, including "-" on
+# failure and "~" for an empty deps array. A missing fingerprint dir
+# means nothing to precompute. Appends to the cache file; the caller
+# creates it fresh for each run. Unit JSONs are immutable while the
+# prune runs, so a cache built before pruning stays valid after it.
+artifact_deps_closure_precompute() {
+  local fp_dir="$1"
+  [ -d "$fp_dir" ] || return 0
+  [ -n "${DEPS_CLOSURE_CACHE:-}" ] || return 0
+  find "$fp_dir" -name '*.json' -print0 2>/dev/null | python3 -c 'import json,sys
+for raw in sys.stdin.buffer.read().split(b"\0"):
+    if not raw:
+        continue
+    try:
+        p = raw.decode()
+        d = json.load(open(p))
+        v = sorted("%s:%s:%s:%s" % (e[0], e[1], str(e[2]).lower(), e[3]) for e in (d.get("deps") or []))
+        print(p + "\t" + (",".join(v) if v else "~"))
+    except Exception:
+        continue' >> "$DEPS_CLOSURE_CACHE" || return 1
 }
 
 # Prints "features kind profile deps-closure" for one (crate, hash)
@@ -431,6 +470,17 @@ prune_target() {
     "$WT"/*) ;;
     *) echo "prune: CARGO_TARGET_DIR=$target_dir is outside worktree $WT; skipping prune" | tee -a "$SUMMARY"; return 0 ;;
   esac
+  # N79: precompute every unit JSON deps closure once (one python3
+  # process per profile) so the per-row lookups below are cache hits
+  # instead of per-row python3 spawns. The cache file is fresh for
+  # this run; keys are absolute JSON paths, so the two profiles never
+  # collide, and JSONs are immutable while the prune runs.
+  local cache="$LOGDIR/deps-closure.cache"
+  rm -f "$cache"
+  : > "$cache"
+  DEPS_CLOSURE_CACHE="$cache"
+  artifact_deps_closure_precompute "$target_dir/release/.fingerprint" || return 1
+  artifact_deps_closure_precompute "$target_dir/debug/.fingerprint" || return 1
   prune_profile_dir "$target_dir/release" || return 1
   sweep_fingerprint_orphans "$target_dir/release" || return 1
   prune_profile_dir "$target_dir/debug" || return 1
