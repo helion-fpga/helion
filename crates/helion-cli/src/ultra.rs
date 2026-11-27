@@ -1255,12 +1255,16 @@ fn segbits_disagree(a: &[BitRef], b: &[BitRef]) -> bool {
 /// PIPs (`CTRL_Wx.INT_NODE_GLOBAL_y` plus
 /// `INT_NODE_GLOBAL_y.GCLK_B_0_z`); a routed PIP conflicts with a
 /// candidate when it disagrees with either one. Verified against
-/// the vendored segbits DB, this yields exactly one PIP for CTRL_W5
-/// (`INT_NODE_SDQ_80_INT_OUT1.LOGIC_OUTS_W22`, which sets bit
-/// 21_35 while every CTRL_W5 leg requires it clear) and none for
-/// CTRL_W4: the CLK2 leg cannot coexist on a tile where the router
-/// uses that PIP, and no GLOBAL choice avoids it, so the fix is in
-/// what routes on the tile, not which GLOBAL is picked. East side
+/// the vendored segbits DB, this yields exactly three PIPs: the
+/// N46 routed PIP `INT_NODE_SDQ_80_INT_OUT1.LOGIC_OUTS_W22` on
+/// INT_X1Y0, which sets bit 21_35 while every CTRL_W5 leg requires
+/// it clear, plus one VCC_WIRE PIP per leg tile
+/// (`CTRL_W5.VCC_WIRE` on INT_X1Y0 and `CTRL_W4.VCC_WIRE` on
+/// INT_X3Y0), each requiring clear every mux bit its CTRL wire's
+/// legs set, so it conflicts with all 8 candidates on that tile.
+/// The CLK2 leg cannot coexist on a tile where the router uses
+/// the SDQ_80 PIP, and no GLOBAL choice avoids it, so the fix is
+/// in what routes on the tile, not which GLOBAL is picked. East side
 /// (N47): the same computation for CTRL_E4 and CTRL_E5 yields
 /// only each wire's VCC_WIRE PIP, so no routed PIP can conflict
 /// with every east-side candidate and the N46 class cannot recur
