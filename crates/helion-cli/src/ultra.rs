@@ -1667,17 +1667,15 @@ fn repair_ff_xpin_conflicts(
         //
         // The search runs in two phases: ABCD-half letters first,
         // EFGH-half letters only after. An FF in the EFGH half needs
-        // its slice's CLK2 driven, and this flow cannot drive CLK2:
-        // clock routing is phase 2, no INT PIP chain connects the
-        // clk primary (CTRL_W4) to CLK2 (CTRL_W5), and the GCLK
-        // spine is undriven in the checker model, so an EFGH FF
-        // fails verify-bit on place even when everything else
-        // routes. Preferring ABCD letters in every slice (including
-        // a second slice's free ABCD letters) over the mover's own
-        // slice's EFGH letters keeps the design clockable on CLK1
-        // alone. EFGH letters stay available as a last resort so a
-        // design that genuinely cannot fit in ABCD halves still
-        // repairs instead of failing loud here.
+        // its slice's CLK2 driven, and a CLK2 leg costs a second
+        // clock-leg slot on the tile: the flow does drive CLK2, but
+        // preferring ABCD letters in every slice (including a second
+        // slice's free ABCD letters) over the mover's own slice's
+        // EFGH letters keeps the design clockable on CLK1 alone and
+        // leaves the second leg slot free. EFGH letters stay
+        // available as a last resort so a design that genuinely
+        // cannot fit in ABCD halves still repairs instead of failing
+        // loud here.
         let mover_clk = packed.slices[slice_idx]
             .ff_clk
             .get(&mover_bel)
