@@ -308,7 +308,7 @@ pub enum CmtKind {
 }
 
 /// A packed Clock Management Tile primitive (`MMCME2_ADV` or `PLLE2_ADV`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PackedCmt {
     pub name: String,
     pub kind: CmtKind,

@@ -86,21 +86,43 @@ fn ug953_mmcm_and_pll_pack_place_route_fasm() {
     assert!(!parsed.is_empty());
 }
 
-/// Fractional dividers are not measured yet: refused, never guessed.
+/// A fractional MMCM with its feedback through a BUFG builds with Vivado's
+/// words (x7_mmcm sweep, Vivado 2017.3, xc7z020clg484-1, 2026-11-26: rows
+/// fb_10_500, o0_2_125, and COMP.ZHOLD for BUFG feedback).
 #[test]
-fn ug953_fractional_mmcm_is_refused() {
+fn ug953_fractional_mmcm_with_bufg_feedback() {
     let mut d = Design::new("cmt_frac");
     add_blackbox(&mut d, "u_mmcm", "MMCME2_ADV");
     d.set_cell_attr("u_mmcm", "CLKIN1_PERIOD", "10.0").unwrap();
     d.set_cell_attr("u_mmcm", "CLKFBOUT_MULT_F", "10.5").unwrap();
-    d.set_cell_attr("u_mmcm", "CLKOUT0_DIVIDE_F", "5.0").unwrap();
+    d.set_cell_attr("u_mmcm", "CLKOUT0_DIVIDE_F", "2.125").unwrap();
     d.connect("clk_in", "u_mmcm", "CLKIN1");
     d.connect("fb", "u_mmcm", "CLKFBOUT");
-    d.connect("fb", "u_mmcm", "CLKFBIN");
+    add_blackbox(&mut d, "u_fbbuf", "BUFG");
+    d.connect("fb", "u_fbbuf", "I");
+    d.connect("fb_buf", "u_fbbuf", "O");
+    d.connect("fb_buf", "u_mmcm", "CLKFBIN");
     d.connect("c0", "u_mmcm", "CLKOUT0");
     let backend = Xilinx7Backend::open("xc7a35t").unwrap();
-    let err = backend.run(&d).unwrap_err();
-    assert!(err.contains("fractional"), "got: {err}");
+    let bs = backend.run(&d).unwrap();
+    let text = bs.fasm.join("\n");
+    for want in [
+        "MMCME2_ADV.COMP.ZHOLD",
+        "MMCME2_ADV.CLKFBOUT_CLKOUT1_HIGH_TIME[5:0] = 6'd4",
+        "MMCME2_ADV.CLKFBOUT_CLKOUT2_FRAC[2:0] = 3'd4",
+        "MMCME2_ADV.CLKFBOUT_CLKOUT2_FRAC_EN[0]",
+        "MMCME2_ADV.CLKFBOUT_CLKOUT2_FRAC_WF_R[0]",
+        "MMCME2_ADV.CLKOUT6_CLKOUT2_FRACTIONAL_FRAC_WF_F[0]",
+        "MMCME2_ADV.CLKOUT6_CLKOUT2_FRACTIONAL_PHASE_MUX_F[2:0] = 3'd2",
+        "MMCME2_ADV.CLKOUT0_CLKOUT1_HIGH_TIME[5:0] = 6'd0",
+        "MMCME2_ADV.CLKOUT0_CLKOUT2_FRAC[2:0] = 3'd1",
+        "MMCME2_ADV.CLKOUT5_CLKOUT2_FRACTIONAL_FRAC_WF_F[0]",
+        "MMCME2_ADV.POWER_REG_POWER_REG_POWER_REG[15:0] = 16'h9900",
+    ] {
+        assert!(text.contains(want), "missing {want}:\n{text}");
+    }
+    assert!(!text.contains("COMP.Z_ZHOLD"), "{text}");
+    assert!(parse_fasm(&text).is_ok());
 }
 
 #[test]
