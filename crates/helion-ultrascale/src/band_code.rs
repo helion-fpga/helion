@@ -213,7 +213,7 @@ pub enum BandCheck {
 /// `~/workspace/ultra-bitgen-crew/logs/n16fix_measure3.py`): 5,584
 /// frames sit in a RAM-letter column and 3,948 of those carry at
 /// least one ambiguous masked set bit. Their per-bit column rank is
-/// 40 to 44 on 3,798 frames, so no bound anywhere near the full rank
+/// 40 to 44 on 3,863 frames, so no bound anywhere near the full rank
 /// is honest: the whole MAP-A table spans only a 44-dimensional
 /// subspace of the 48-bit band, and at rank 44 a random wrong band
 /// lands in the span with probability 1 in 16. At rank 24 the
