@@ -477,7 +477,8 @@ pub fn run(
     let routed = be.route(&placed)?;
     let t_route = t0.elapsed();
     // G41 wire-model probe: `HELION_HOP_DUMP=<path>` writes
-    // `<dx> <dy> <lx> <ly> <routed_ps> <pips>` for every fabric load, so the
+    // `<dx> <dy> <lx> <ly> <routed_ps> <pips> <pin_ps>` for every fabric load
+    // (`pin_ps`: the load's site-pin delay, `timing::site_pin_ps`), so the
     // placer's wire estimate can be fitted on all connections rather than on a
     // single worst path (fitting one path is what produced the bad 964 + 49
     // figure). Off unless the variable is set.
@@ -524,7 +525,8 @@ pub fn run(
             let (lx, ly) = xy.get(site.as_str()).copied().unwrap_or((-1, -1));
             let (dx, dy) = drv_xy.get(net.as_str()).copied().unwrap_or((-1, -1));
             let np = pips_of.get(net.as_str()).copied().unwrap_or(0);
-            lines.push_str(&format!("{dx} {dy} {lx} {ly} {delay} {np}\n"));
+            let pin_ps = crate::timing::site_pin_ps(site, pin);
+            lines.push_str(&format!("{dx} {dy} {lx} {ly} {delay} {np} {pin_ps}\n"));
         }
         let _ = std::fs::write(dst, lines);
     }

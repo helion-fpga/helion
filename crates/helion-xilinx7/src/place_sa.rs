@@ -74,9 +74,11 @@ const TIMING_EXP: i32 = 4;
 /// That is the router's own delay (pip delays only: least-squares fit
 /// 517 + 23 ps per slice over 6,352 routed PicoRV32 loads; the slope is
 /// rounded up to 30 so a tile column never costs under 60 ps, see below) plus the
-/// timer's `net_extra_ps`, the part the pips miss, so the placer and the
-/// timer agree on which paths are critical. Distance is counted in slices:
-/// a tile column holds two slice columns, a tile row one slice row.
+/// timer's `net_extra_ps` of it, the part the pips miss, so the placer and the
+/// timer agree on which paths are critical. The placer does not know the load
+/// pin, so it takes `PIN_PS`, the mean site-pin delay over routed loads.
+/// Distance is counted in slices: a tile column holds two slice columns, a
+/// tile row one slice row.
 ///
 /// History (G41): the previous 500 + 60 ps per tile was fitted to the
 /// router's pip sums alone, which a vendor router measures 50-60% higher;
@@ -85,10 +87,13 @@ const TIMING_EXP: i32 = 4;
 /// lowered for accuracy (this model is steeper everywhere).
 pub fn wire_ps(dx: i32, dy: i32) -> i64 {
     let d = 2 * dx.unsigned_abs() + dy.unsigned_abs();
-    WIRE_BASE_PS + WIRE_SLICE_PS * d as i64 + crate::timing::net_extra_ps(d) as i64
+    let route = WIRE_BASE_PS + WIRE_SLICE_PS * d as i64;
+    route + crate::timing::net_extra_ps(route as u32, PIN_PS) as i64
 }
 const WIRE_BASE_PS: i64 = 517;
 const WIRE_SLICE_PS: i64 = 30;
+/// 347 ps over PicoRV32's 7,024 routed loads, 93% of them LUT inputs.
+const PIN_PS: u32 = 350;
 
 #[derive(Clone, Copy)]
 enum Loc {
@@ -1112,18 +1117,18 @@ mod tests {
     /// routing, and monotonic in distance.
     #[test]
     fn wire_model_matches_the_timer_and_stays_above_the_routing_cliff() {
-        assert_eq!(wire_ps(0, 0), 517 + crate::timing::net_extra_ps(0) as i64);
-        assert_eq!(wire_ps(3, 4) - wire_ps(0, 0), 30 * 10 + 95 * 10, "3 tile columns + 4 rows = 10 slices");
+        assert_eq!(wire_ps(0, 0), 517 + crate::timing::net_extra_ps(517, PIN_PS) as i64);
+        assert_eq!(wire_ps(3, 4) - wire_ps(0, 0), (517 + 300) * 9 / 8 - 517 * 9 / 8, "3 tile columns + 4 rows = 10 slices");
         for d in 0..64 {
             assert!(wire_ps(d + 1, 0) - wire_ps(d, 0) >= 60, "per-tile slope under the routing cliff at {d}");
             assert!(wire_ps(0, d + 1) > wire_ps(0, d), "wire_ps not monotonic at {d}");
         }
-        // G93's guard: within 15% of a vendor router's median slice-to-slice
-        // delay per distance bin (PicoRV32, xc7z020 -1, 20,261 loads), taken at
-        // each bin's median distance in slices: (slices, measured ps).
-        for (d, measured) in [(3, 973), (6, 1373), (12, 2040), (17, 2156)] {
+        // G93's guard: within 15% of what the timer charges Helion's own routes
+        // (pips + net_extra_ps with the real pin) per distance bin, PicoRV32,
+        // 7,024 loads, at each bin's median distance in slices: (slices, ps).
+        for (d, charged) in [(1, 931), (4, 1066), (9, 1229), (16, 1472)] {
             let e = wire_ps(0, d) as f64;
-            assert!((e - measured as f64).abs() / (measured as f64) < 0.15, "wire_ps at {d} slices = {e}, measured median {measured}");
+            assert!((e - charged as f64).abs() / (charged as f64) < 0.15, "wire_ps at {d} slices = {e}, timer's median {charged}");
         }
     }
 

@@ -257,28 +257,36 @@ pub const UNKNOWN_ROUTE_PS: u32 = 1200;
 /// clock skew within one buffer's tree (p90 199 ps over 282 measured paths).
 pub const MARGIN_PS: u32 = 235;
 
-/// What the router's delay misses on a fabric connection, in ps, for a driver
-/// and load slice `d` sites apart (Manhattan).
-///
-/// The router sums X-Ray's pip delays only: this database has no wire
-/// resistance/capacitance for 568 of INT's 600 wires, and no site-pin delay.
-/// Against a vendor-routed PicoRV32 (20,261 loads) its delays were 50-60% low
-/// at every distance (median 668 vs 1,373 ps at 5-9 sites). This is the
-/// least-error fit of the per-distance medians (mean error 71 ps over d = 0-19);
-/// past 13 sites long wires take over and the gap stops growing.
-pub fn net_extra_ps(d: u32) -> u32 {
-    130 + 95 * d.min(13)
+/// Site-pin delay of slice LUT inputs 1-6, ps (X-Ray `tile_type_CLBL*.json`
+/// `site_pins`, slow max): the worst of A-D over the four CLB tile types, at
+/// most 28 ps above the best. Every other site pin is 0-1 ps.
+pub const LUT_PIN_PS: [u32; 6] = [540, 520, 377, 317, 137, 22];
+
+/// Site-pin delay of load pin `pin` at `site`: a slice LUT input `A1`..`D6`,
+/// else 0 (a DSP's `A1` is a data bit, not a LUT input).
+pub fn site_pin_ps(site: &str, pin: &str) -> u32 {
+    match pin.as_bytes() {
+        [b'A'..=b'D', n @ b'1'..=b'6'] if site.starts_with("SLICE") => LUT_PIN_PS[(n - b'1') as usize],
+        _ => 0,
+    }
 }
 
-/// `net_extra_ps` between two sites, or its value at 6 sites (the median
-/// connection) when either is not a slice (block RAM, DSP and I/O sites have
-/// their own coordinate grids).
-fn net_extra_between(a: Option<&str>, b: &str) -> u32 {
-    let xy = |s: &str| s.starts_with("SLICE_").then(|| crate::place::parse_site_xy(s)).flatten();
-    match (a.and_then(xy), xy(b)) {
-        (Some((ax, ay)), Some((bx, by))) => net_extra_ps(ax.abs_diff(bx) + ay.abs_diff(by)),
-        _ => net_extra_ps(6),
-    }
+/// What the router's delay `route_ps` misses on a routed connection, ps: the
+/// load's site-pin delay (`site_pin_ps`, which the router leaves out) plus an
+/// eighth of the pip sum.
+///
+/// Fitted by pricing Vivado's own routes the way the router does (X-Ray pip
+/// delay + 15 ps per pip) on 66,073 sinks of six vendor builds (blinky, bram,
+/// dsp_prims, ibex, mmcm, pico; all nets): Vivado's slow-max delay is that sum
+/// plus the site-pin delay to a median 9 ps; what is left grows with fanout
+/// and path length, which the eighth covers. Every design's median error is
+/// then pessimistic (46-85 ps), and so is every fanout and length class but
+/// 65+ loads (17 ps optimistic); 23% of sinks are optimistic, p90 39 ps.
+/// The distance correction it replaces (130 + 95 per slice up to 13) was
+/// 348 ps off at the median on the same sinks, about 900 ps pessimistic past
+/// 13 slices, and 600 ps on block RAM, DSP and I/O loads.
+pub fn net_extra_ps(route_ps: u32, pin_ps: u32) -> u32 {
+    route_ps / 8 + pin_ps
 }
 /// Block RAM, slow corner from X-Ray's `timings/BRAM_L.sdf`: CLK -> DO
 /// without the output register, and the worst input setup (DI; address,
@@ -669,32 +677,13 @@ fn analyze_domain(routed: &Routed7, domain: &str, period_ps: u32) -> Result<Anal
     }
     // Pins as the router named them: LUT inputs A1..D6 (letter from BEL).
     let lut_letter: HashMap<&str, char> = placed.luts.iter().map(|l| (l.name.as_str(), l.bel.chars().next().unwrap_or('A'))).collect();
-    // Driver site of every net, for the distance part of a connection's delay.
-    let mut drv_site: HashMap<&str, &str> = HashMap::new();
-    for l in &packed.luts {
-        if let Some(s) = site_of.get(l.name.as_str()) {
-            drv_site.insert(l.output_net.as_str(), s);
-        }
-    }
-    for f in &packed.ffs {
-        if let Some(s) = site_of.get(f.name.as_str()) {
-            drv_site.insert(f.q_net.as_str(), s);
-        }
-    }
-    for c in &packed.carries {
-        if let Some(s) = site_of.get(c.name.as_str()) {
-            for n in c.o_nets.iter().chain(std::iter::once(&c.co_net)).chain(c.co_nets.iter()).flatten() {
-                drv_site.insert(n.as_str(), s);
-            }
-        }
-    }
     let route = |net: &str, site: &str, pin: &str, internal: bool| -> u32 {
         // F7/F8 inputs come from the slice's own LUTs.
         if internal || pin.starts_with("F7F8_") {
             return SITE_INTERNAL_PS;
         }
         match routed.load_delays.get(&(net.to_string(), site.to_string(), pin.to_string())) {
-            Some(&d) => d + net_extra_between(drv_site.get(net).copied(), site),
+            Some(&d) => d + net_extra_ps(d, site_pin_ps(site, pin)),
             None => UNKNOWN_ROUTE_PS,
         }
     };
@@ -1186,7 +1175,7 @@ mod tests {
     /// The arcs the vendor timer was measured to charge: a LUT input that
     /// arrives on a carry sum bit (AMUX..DMUX) costs `LUT_XMUX_PS`, one from a
     /// flop `LUT_PS`; the sum bit takes S0 -> O0 from the per-bit table; every
-    /// routed connection adds `net_extra_ps` of its slice distance; flops
+    /// routed connection adds `net_extra_ps` of its pip sum and pin; flops
     /// launch at `FF_CKQ_PS`. Pins the measured values, so a "tidy-up" back
     /// to the old 303 ps clock-to-Q or one LUT delay for all inputs fails here.
     #[test]
@@ -1210,15 +1199,38 @@ mod tests {
             r.load_delays.insert((net.into(), site.into(), pin.into()), 500);
         }
         let a = analyze_clocks(&r, &|_| Some(10_000)).unwrap();
-        // f0 -> carry S0 (inside the slice) -> O0 -> 2 sites -> l1 (slow arc) -> 2 sites -> f1.
-        let via_carry = FF_CKQ_PS + SITE_INTERNAL_PS + CARRY_S_PS[0][0] + 500 + net_extra_ps(2) + LUT_XMUX_PS + 500 + net_extra_ps(2);
+        // f0 -> carry S0 (inside the slice) -> O0 -> LUT pin A1 -> l1 (slow arc) -> AX -> f1.
+        let via_carry = FF_CKQ_PS + SITE_INTERNAL_PS + CARRY_S_PS[0][0] + 500 + 500 / 8 + LUT_PIN_PS[0] + LUT_XMUX_PS + 500 + 500 / 8;
         assert_eq!((a.endpoints, a.wns_ps), (2, 10_000 - (FF_SETUP_PS + MARGIN_PS + via_carry) as i64), "{:?}", a.worst_path);
-        // Without the carry path, f2's path (flop -> 4 sites -> l2, fast arc) is the worst.
+        // Without the carry path, f2's path (flop -> B1 -> l2, fast arc -> BX) is the worst.
         r.placed.packed.ffs.retain(|f| f.name != "f1");
         let a = analyze_clocks(&r, &|_| Some(10_000)).unwrap();
-        let via_ff = FF_CKQ_PS + 500 + net_extra_ps(4) + LUT_PS + 500 + net_extra_ps(2);
+        let via_ff = FF_CKQ_PS + 500 + 500 / 8 + LUT_PIN_PS[0] + LUT_PS + 500 + 500 / 8;
         assert_eq!(a.wns_ps, 10_000 - (FF_SETUP_PS + MARGIN_PS + via_ff) as i64, "{:?}", a.worst_path);
-        assert_eq!((FF_CKQ_PS, LUT_PS, LUT_XMUX_PS, MARGIN_PS, net_extra_ps(0), net_extra_ps(13), net_extra_ps(40)), (456, 124, 299, 235, 130, 1365, 1365));
+        assert_eq!((FF_CKQ_PS, LUT_PS, LUT_XMUX_PS, MARGIN_PS), (456, 124, 299, 235));
+    }
+
+    /// G124 guard: a routed connection costs its pip sum, an eighth more, and
+    /// the load's site-pin delay, not a charge by distance. On Vivado's own
+    /// routes this was pessimistic at the median on every one of six designs;
+    /// a ~10-pip long-line hop (2,000 ps of pips) must stay near Vivado's
+    /// 2.4-2.6 ns, not the 3.4 ns the old flat 1,365 ps past 13 slices gave,
+    /// and a short hop into A1 must keep A1's 540 ps pin delay.
+    #[test]
+    fn net_extra_is_priced_by_wires_and_pin_not_distance() {
+        assert_eq!(LUT_PIN_PS, [540, 520, 377, 317, 137, 22]);
+        assert_eq!((site_pin_ps("SLICE_X3Y4", "A1"), site_pin_ps("SLICE_X3Y4", "D6"), site_pin_ps("SLICE_X3Y4", "C3")), (540, 22, 377));
+        // Not LUT inputs: bypass, clock enable, a DSP data bit, a block RAM address.
+        for (site, pin) in [("SLICE_X3Y4", "AX"), ("SLICE_X3Y4", "CE"), ("DSP48_X0Y0", "A1"), ("RAMB36_X0Y0", "ADDRARDADDR3")] {
+            assert_eq!(site_pin_ps(site, pin), 0, "{site}.{pin}");
+        }
+        assert_eq!((net_extra_ps(0, 0), net_extra_ps(800, 0), net_extra_ps(800, 540)), (0, 100, 640));
+        let long_line = 2_000 + net_extra_ps(2_000, site_pin_ps("SLICE_X0Y0", "A3"));
+        assert!((2_400..=3_000).contains(&long_line), "long-line hop charged {long_line} ps");
+        // Monotonic in the pip sum: a longer route is never charged less.
+        for d in (0..5_000).step_by(7) {
+            assert!(d + 1 + net_extra_ps(d + 1, 0) > d + net_extra_ps(d, 0));
+        }
     }
 
     /// A PS7 port clock no flop shares is still a domain: its input is
@@ -1248,8 +1260,8 @@ mod tests {
         let period = |c: &str| (c == "clk_a").then_some(10_000);
         let a = analyze_clocks(&routed, &period).unwrap();
         // ARADDR clock-to-out 1438 + LUT input wire (unknown) + LUT + 2000 to RDATA (setup 550).
-        // The LUT is not placed, so the RDATA connection gets the median-distance extra.
-        let t = 1438 + UNKNOWN_ROUTE_PS + LUT_PS + 2000 + net_extra_ps(6);
+        // RDATA is no LUT input: its connection adds only an eighth of its pips.
+        let t = 1438 + UNKNOWN_ROUTE_PS + LUT_PS + 2000 + net_extra_ps(2000, 0);
         assert_eq!((a.endpoints, a.wns_ps), (1, 10_000 - 550 - MARGIN_PS as i64 - t as i64), "{:?}", a.worst_path);
         let mut into_ff = routed.clone();
         into_ff.placed.packed.ffs.push(ff("f", "r0", "q"));
