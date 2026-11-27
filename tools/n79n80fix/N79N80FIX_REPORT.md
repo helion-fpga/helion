@@ -82,16 +82,22 @@ Measured with
 
 | run | prune_target total |
 |-----|--------------------|
+| first after run | 262.38s |
 | after 1 | 99.59s |
 | after 2 | 95.95s |
 | after 3 (final code) | 60.98s |
 
-After median: 95.95s. Conservative reading (median after vs mean
-control): 162.0s to 95.95s, about 41% faster, about 66s saved, 1.7x.
+After median: 97.77s. Conservative reading (median after vs mean
+control): 162.0s to 97.77s, about 40% faster, about 64s saved, 1.7x.
 The 60.98s run is a fast outlier from shared-CPU variance on this VM
 and is not claimed as typical. The two control runs cluster tightly
-(160-164s) and the first two after runs cluster tightly (96-100s),
-so the reduction is real and not measurement noise.
+(160-164s) and the after-target runs cluster tightly (96-100s),
+so the reduction is real and not measurement noise. Correction (N83):
+the first after run at 262.38s
+(`~/workspace/ultra-bitgen-crew/logs/n79n80fix/after/timings.txt`)
+was omitted from this list in the first version of this report;
+including it moves the median from 95.95s to 97.77s and the headline
+from about 41% to about 40% faster, so the conclusion stands.
 
 ### Micro-benchmarks
 
@@ -120,12 +126,12 @@ files deleted 0, fingerprint dirs deleted 0; both orphan sweeps
 deleted 0 dirs, freed 0 bytes. Target snapshots (deps file lists and
 fingerprint dir lists, before vs after) are identical in every run.
 
-A fourth after run went through the fallback path only (direct
+The first after run went through the fallback path only (direct
 `prune_profile_dir` calls, cache never set, 262.38s under concurrent
 load from the synthetic test and a scratch-tree build running at the
-same time). Its decisions are also byte-identical to control; its
-timing is not a datapoint because of the concurrent load, and it is
-not counted in the after timings above.
+same time). Its decisions are also byte-identical to control. It is
+listed in the after timings above; the first version of this report
+omitted it, which N83 corrects.
 
 ## N80: orphan sweep tmp dir
 
@@ -172,8 +178,13 @@ No EXIT trap is set on purpose: it would replace a caller's EXIT trap
 
 ### Kill-test proof on fixed code (TERM)
 
-Two independent TERM kill tests on the fixed code, same driver, fresh
-scratch trees of 4,000 orphan dirs each:
+Two independent TERM kill tests on the fixed code, same driver.
+Correction (N83): kill-after2 did not start from a fresh 4,000-orphan
+scratch tree. Its kill-result.txt says "orphan dirs before: 3980"
+(`~/workspace/ultra-bitgen-crew/logs/n79n80fix/kill-after2/kill-result.txt`
+line 3), the leftover of kill-after (4,001 before minus 21 deleted),
+so kill-after2 reused the kill-after tree. The trap proof itself
+holds (tmp dir gone, exit 143 on both fixed runs).
 
 | run | audit lines at kill | process | wait status | tmp dir after kill | dirs deleted / remaining |
 |-----|---------------------|---------|-------------|--------------------|--------------------------|
@@ -208,7 +219,7 @@ trap survives the sweep's TERM trap (its work dir is cleaned).
   can cover those. Also the sub-millisecond window between `mktemp
   -d` and the trap setup. Both are trivial (3 small hash files).
 - R3: timing variance on this shared VM is large (after runs 61s to
-  100s); the conservative median-vs-mean reading (about 41% faster)
+  262s); the conservative median-vs-mean reading (about 40% faster)
   is the claim, not the fastest run.
 - R4: SIGINT is not covered, by bash design (see N80 section). TERM
   is the covered kill signal, which matches the critic's filed case
@@ -216,8 +227,9 @@ trap survives the sweep's TERM trap (its work dir is cleaned).
 - R5: the cache file `$LOGDIR/deps-closure.cache` is a new log
   artifact (476 lines on the reference target). It is recreated fresh
   on every `prune_target` run.
-- R6: the fallback-path after run (262.38s) ran under concurrent load
-  and is a decision-identity datapoint only, not a timing datapoint.
+- R6: the fallback-path after run (262.38s) ran under concurrent load;
+  it is listed in the after timings above (N83 correction) and its
+  decisions are byte-identical to control.
 
 ## Verification logs
 
@@ -225,7 +237,8 @@ All logs under `~/workspace/ultra-bitgen-crew/logs/n79n80fix/`:
 
 - `control/`, `control2/`: control prune runs (base code), timings,
   prune tables, before/after snapshots, extracted functions.
-- `after/`: fallback-path after run (decision identity only).
+- `after/`: first after run, fallback path (262.38s, listed in the
+  after timings above).
 - `after-target/`, `after-target2/`, `after-target3/`: after prune
   runs through the shipped `prune_target` (after-target3 is the
   final code); each holds `timings.txt`, `suite-summary.txt`,
