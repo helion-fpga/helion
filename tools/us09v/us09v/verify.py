@@ -163,6 +163,31 @@ def decode_bitstream(bit_path: str, db_root: str, part: str = "xczu3eg-sbva484-1
     return lines, r.returncode, r.stderr
 
 
+def _ports_input_error(
+    rtl_files: list[str] | None, top: str | None
+) -> str | None:
+    """N37: RTL files and a top module go together. One without the
+    other means the caller asked for ports but left out the half the
+    ports step needs, so failing here names the missing flag
+    instead of letting place/route/extract fail later on an
+    undriven clock. Returns None when the pair is consistent:
+    both given, or neither given (a decode-only run, where ports
+    are legitimately skipped)."""
+    if rtl_files and not top:
+        return (
+            "RTL files given but no --top: cannot determine the top "
+            "module, so ports cannot be derived. Pass --top <module> "
+            "with --rtl."
+        )
+    if top and not rtl_files:
+        return (
+            "--top given but no --rtl: cannot derive ports without "
+            "RTL files. Pass --rtl <file> with --top, or drop --top "
+            "for a decode-only run."
+        )
+    return None
+
+
 def verify_fasm(
     design: str,
     fasm_path: str,
@@ -208,6 +233,14 @@ def verify_fasm(
     port_ins: dict = {}
     port_outs: dict = {}
     cosim_pin_of: dict | None = None
+    # N37: fail loud here, before place/route/extract, when the
+    # caller gave RTL files without a top or a top without RTL
+    # files. Without this the ports block below is silently skipped
+    # and the run fails downstream naming an undriven clock.
+    ports_err = _ports_input_error(rtl_files, top)
+    if ports_err is not None:
+        rep.add("ports", False, ports_err)
+        return rep
     if rtl_files and top and (xdc or port_map):
         from .cosim import sv_ports
         from .ports import explicit_ports_in_out, ports_from_xdc
