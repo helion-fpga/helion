@@ -1843,8 +1843,7 @@ fn port_entry(
     placed: &helion_ultrascale::UltraPlaced,
     packed: &helion_ultrascale::UltraPacked,
 ) -> Option<(helion_ultrascale::UltraSite, String, String)> {
-    let mut ordered: Vec<&(helion_ultrascale::UltraSite, String, String)> =
-        rsinks.iter().collect();
+    let mut ordered: Vec<&(helion_ultrascale::UltraSite, String, String)> = rsinks.iter().collect();
     ordered.sort_by_key(|(s, b, p)| (s.x, s.y, b.clone(), p.clone()));
     let mut seen: Vec<helion_ultrascale::UltraSite> = Vec::new();
     for (site, _, _) in &ordered {
@@ -2560,15 +2559,18 @@ mod tests {
         ))
         .unwrap();
         let mut db = IntTileWireDb::single_tile("INT_X0Y0", 0, 0, &tile_json).unwrap();
-        let site = helion_ultrascale::UltraSite { x: 0, y: 0, kind: 0 };
+        let site = helion_ultrascale::UltraSite {
+            x: 0,
+            y: 0,
+            kind: 0,
+        };
         db.add_pin_wire(site, "A6LUT", "O6", "INT_X0Y0", "LOGIC_OUTS_W0")
             .unwrap();
         db.add_pin_wire(site, "AQ", "D", "INT_X0Y0", "BOUNCE_W_0_FT1")
             .unwrap();
         db.add_pin_wire(site, "B6LUT", "I0", "INT_X0Y0", "IMUX_W11")
             .unwrap();
-        let r = route_ultra(&nets, &db, UltraRouteOpts::default())
-            .expect("port net must route");
+        let r = route_ultra(&nets, &db, UltraRouteOpts::default()).expect("port net must route");
         assert_eq!(r.overused_nodes, 0);
         let din_route = &r.routes[0];
         let ax = db.wire_id("INT_X0Y0", "BOUNCE_W_0_FT1").unwrap();
