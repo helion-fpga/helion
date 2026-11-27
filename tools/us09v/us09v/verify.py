@@ -7,6 +7,14 @@ A design is trusted only when every check passes. A failure names
 the check and the first few violations; nothing is reported as a
 pass on a partial result.
 
+Decoder selection (N34): the decoder binary must be built from the
+current branch. The default is the release binary of this checkout,
+and it refuses to run when it is missing or older than the decoder
+sources in this checkout, because a binary built before the N7-port
+decode change fails decode with unexplained band bits that are not
+real. An explicit US09V_DECODER_BIN is the caller's assertion about
+which decoder to use and is used as-is once it exists.
+
 No em dashes anywhere.
 """
 from __future__ import annotations
@@ -21,10 +29,94 @@ from .extract import Extractor, to_verilog
 from .fabric import Fabric
 from .fasmio import parse_fasm_file, to_fasm
 
+
+def _repo_root() -> str:
+    """Repo root of this checkout (four levels above
+    tools/us09v/us09v/verify.py)."""
+    return os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+
+
+_REBUILD_CMD = "cargo build --release -j2 -p helion-ultrascale --bin helion-bitgen"
+
 DECODER_BIN = os.environ.get(
     "US09V_DECODER_BIN",
-    os.path.expanduser("~/workspace/helion-ultra-bitgen-decoder/target/release/helion-bitgen"),
+    os.path.join(_repo_root(), "target", "release", "helion-bitgen"),
 )
+
+_DECODER_FROM_ENV = "US09V_DECODER_BIN" in os.environ
+
+
+def _newest_decoder_source() -> tuple[str, float] | None:
+    """Newest mtime among the files that determine what the
+    helion-bitgen decoder binary does: the helion-ultrascale crate
+    sources, its Cargo.toml, and its data files. Returns None when
+    none of those paths exist (verify.py running outside a checkout);
+    the caller then skips the staleness gate but still enforces
+    that the binary exists."""
+    crate = os.path.join(_repo_root(), "crates", "helion-ultrascale")
+    cands = [os.path.join(crate, "Cargo.toml")]
+    src = os.path.join(crate, "src")
+    if os.path.isdir(src):
+        for dirpath, _dirnames, filenames in os.walk(src):
+            for name in filenames:
+                if name.endswith(".rs"):
+                    cands.append(os.path.join(dirpath, name))
+    data = os.path.join(crate, "data")
+    if os.path.isdir(data):
+        for dirpath, _dirnames, filenames in os.walk(data):
+            for name in filenames:
+                cands.append(os.path.join(dirpath, name))
+    newest: tuple[str, float] | None = None
+    for path in cands:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if newest is None or mtime > newest[1]:
+            newest = (path, mtime)
+    return newest
+
+
+def resolve_decoder_bin() -> str:
+    """Resolve the decoder binary, failing loud instead of silently
+    measuring with the wrong decoder (N34).
+
+    An explicit US09V_DECODER_BIN is used as-is once it exists.
+    The default must be a decoder built from this checkout: a
+    missing default, or one older than the decoder sources in this
+    checkout, raises instead of running, because it may predate
+    the N7-port decode change.
+    """
+    path = DECODER_BIN
+    if not os.path.isfile(path):
+        if _DECODER_FROM_ENV:
+            raise RuntimeError(
+                f"US09V_DECODER_BIN points at a missing file: {path}. "
+                "Point it at a helion-bitgen binary built from the current branch."
+            )
+        raise RuntimeError(
+            f"decoder binary not built: {path} does not exist. "
+            f"Build it from this checkout with {_REBUILD_CMD} "
+            f"(run in {_repo_root()}), or set US09V_DECODER_BIN to a "
+            "helion-bitgen binary built from the current branch."
+        )
+    if not _DECODER_FROM_ENV:
+        newest = _newest_decoder_source()
+        if newest is not None:
+            src_path, src_mtime = newest
+            if src_mtime > os.path.getmtime(path):
+                raise RuntimeError(
+                    f"stale decoder binary: {path} predates the decoder sources "
+                    f"in this checkout ({src_path} is newer than the binary). "
+                    "A binary built before the N7-port decode change fails decode "
+                    "with unexplained band bits that are not real. Rebuild it from "
+                    f"this checkout with {_REBUILD_CMD} (run in {_repo_root()}), "
+                    "or set US09V_DECODER_BIN to a helion-bitgen binary built "
+                    "from the current branch."
+                )
+    return path
 
 
 @dataclass
@@ -64,7 +156,7 @@ def decode_bitstream(bit_path: str, db_root: str, part: str = "xczu3eg-sbva484-1
     Exit 1 with unexplained bits still returns the FASM printed on
     stdout (incomplete); the caller decides what that means."""
     r = subprocess.run(
-        [DECODER_BIN, "decode", "--bit", bit_path, "--db-root", db_root, "--part", part],
+        [resolve_decoder_bin(), "decode", "--bit", bit_path, "--db-root", db_root, "--part", part],
         capture_output=True, text=True,
     )
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
