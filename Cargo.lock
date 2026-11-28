@@ -1925,6 +1925,7 @@ dependencies = [
  "helion-pack",
  "helion-place",
  "helion-route",
+ "helion-sim",
  "rayon",
  "sv-parser",
  "varisat",

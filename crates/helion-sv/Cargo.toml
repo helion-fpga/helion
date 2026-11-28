@@ -24,6 +24,9 @@ helion-fabric = { workspace = true }
 helion-pack = { workspace = true }
 helion-place = { workspace = true }
 helion-route = { workspace = true }
+# G126: value-level guard for the LUT multiplier (helion-sim models Carry4
+# CO pins; the external svcheck script does not yet, see the G126 report).
+helion-sim = { workspace = true }
 [[bench]]
 name = "synth"
 harness = false
