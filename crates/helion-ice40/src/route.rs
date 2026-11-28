@@ -13,11 +13,16 @@
 //! a `gbufin` IO tile, or the `padin_glb_netwk` extra bit for PLLs) ->
 //! `glb_netwk` -> per-tile `lutff_global/clk`. See [`crate::gclk`].
 
-use crate::device::{io_span_map, span_aliases, tile_db, tile_kind, TileKind};
+use crate::device::{span_aliases, tile_db, tile_kind, TileKind};
 use crate::gclk;
 use crate::place::PlacedIce;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering;
+
+/// Is `name` a span wire (whose copper [`span_aliases`] knows)?
+fn is_span(name: &str) -> bool {
+    ["sp4_", "sp12_", "span4_", "span12_"].iter().any(|p| name.starts_with(p))
+}
 
 /// A routing-graph node id. Ids below `span_count` are canonical span wires;
 /// the next 8 are the canonical `glb_netwk_0`..`glb_netwk_7` wires (every
@@ -57,6 +62,9 @@ pub struct Router {
     node_xy: Vec<(u8, u8)>,
     adj: Vec<Vec<Edge>>,
     rel_edges: Vec<Vec<RelEdge>>, // per TileKind discriminant
+    /// Extra nodes an edge connects besides its destination, keyed by
+    /// `(tile_x, tile_y, kind_idx, rel_idx)` (see [`Router::edge_claims`]).
+    claims: HashMap<(u8, u8, u8, u32), Vec<NodeId>>,
 }
 
 fn kind_idx(k: TileKind) -> usize {
@@ -81,10 +89,10 @@ fn parse_glb_netwk(name: &str) -> Option<u8> {
 /// `icebox.py::follow_funcnet`. Tile `(x, y)`'s `neigh_op_<dir>_<n>`
 /// (logic tiles) or `logic_op_<dir>_<n>` (IO tiles) is driven by the
 /// neighboring tile's `lutff_<n>/out` (logic neighbor) or `io_<m>/D_IN_<k>`
-/// (IO neighbor, per `rlookup_funcnet`'s func mapping).
-/// Returns `None` when the driver is not representable (RAM neighbor,
-/// off-chip edge); the caller then keeps the wire as an unconnected node,
-/// exactly like the old exclusion did.
+/// (IO neighbor, per `rlookup_funcnet`'s func mapping) or `ram/RDATA_*`
+/// (RAM neighbor, per `lookup_funcnet`).
+/// Returns `None` when there is no driver (off-chip edge, or an IO tile next
+/// to an IO tile); the caller then keeps the wire as an unconnected node.
 fn neigh_op_alias(x: u8, y: u8, name: &str) -> Option<(u8, u8, String)> {
     let rest = name
         .strip_prefix("neigh_op_")
@@ -112,7 +120,11 @@ fn neigh_op_alias(x: u8, y: u8, name: &str) -> Option<(u8, u8, String)> {
     let (dx, dy) = (dx as u8, dy as u8);
     match tile_kind(dx, dy) {
         Some(TileKind::Logic) => Some((dx, dy, format!("lutff_{n}/out"))),
-        Some(TileKind::IoTop | TileKind::IoBottom | TileKind::IoLeft | TileKind::IoRight) => {
+        // icebox.py lookup_funcnet (8k): RAMB func n is RDATA_{15-n}, RAMT RDATA_{7-n}.
+        Some(TileKind::Ramb) => Some((dx, dy, format!("ram/RDATA_{}", 15 - n))),
+        Some(TileKind::Ramt) => Some((dx, dy, format!("ram/RDATA_{}", 7 - n))),
+        // An IO tile's logic_op_* wires come from the fabric only.
+        Some(TileKind::IoTop | TileKind::IoBottom | TileKind::IoLeft | TileKind::IoRight) if name.starts_with("neigh_op_") => {
             // icebox.py rlookup_funcnet: io_0/D_IN_0 <- {0,4},
             // io_0/D_IN_1 <- {1,5}, io_1/D_IN_0 <- {2,6}, io_1/D_IN_1 <- {3,7}.
             let (m, k) = match n {
@@ -133,7 +145,6 @@ impl Router {
     pub fn build() -> Self {
         let aliases = span_aliases();
         let span_count = aliases.values().max().map(|v| v + 1).unwrap_or(0);
-        let io_map = io_span_map();
 
         // Span bounding boxes for the A* heuristic.
         let mut span_bbox = vec![(99i32, -99i32, 99i32, -99i32); span_count as usize];
@@ -156,8 +167,12 @@ impl Router {
             TileKind::IoRight,
         ];
         let mut rel_edges: Vec<Vec<RelEdge>> = Vec::new();
+        // Per kind: rel index -> dst names of other entries whose full bit
+        // pattern holds whenever this entry's set bits are the only ones set.
+        let mut co_dsts: Vec<Vec<Vec<String>>> = Vec::new();
         for &k in &kinds {
             let mut rel = Vec::new();
+            let mut pats: Vec<(Vec<(u8, u8, bool)>, String)> = Vec::new();
             for e in tile_db(k) {
                 if !matches!(
                     e.func,
@@ -180,7 +195,21 @@ impl Router {
                     dst: e.dst.clone(),
                     bits,
                 });
+                pats.push((e.bits.iter().map(|b| (b.row, b.bit, b.val)).collect(), e.dst.clone()));
             }
+            let co: Vec<Vec<String>> = pats
+                .iter()
+                .enumerate()
+                .map(|(i, (pa, da))| {
+                    let on: HashSet<(u8, u8)> = pa.iter().filter(|b| b.2).map(|b| (b.0, b.1)).collect();
+                    pats.iter()
+                        .enumerate()
+                        .filter(|(j, (pb, db))| *j != i && db != da && pb.iter().all(|&(r, c, v)| on.contains(&(r, c)) == v))
+                        .map(|(_, (_, db))| db.clone())
+                        .collect()
+                })
+                .collect();
+            co_dsts.push(co);
             rel_edges.push(rel);
         }
 
@@ -192,6 +221,7 @@ impl Router {
             node_xy: Vec::new(),
             adj: Vec::new(),
             rel_edges,
+            claims: HashMap::new(),
         };
         // Size adjacency for span wires + 8 canonical glb wires + room for
         // interned nodes.
@@ -211,10 +241,24 @@ impl Router {
                     .map(|re| (re.src.clone(), re.dst.clone()))
                     .collect();
                 for (ri, (src, dst)) in rels.iter().enumerate() {
-                    let src_id = r.resolve(x, y, src, aliases, io_map);
-                    let dst_id = r.resolve(x, y, dst, aliases, io_map);
+                    // A span name the tile does not have (IceStorm's
+                    // tile_has_net) is no wire: skip the entry, as icebox does.
+                    let (Some(src_id), Some(dst_id)) = (r.resolve(x, y, src, aliases), r.resolve(x, y, dst, aliases)) else {
+                        continue;
+                    };
                     if src_id == dst_id {
                         continue;
+                    }
+                    if !co_dsts[ki][ri].is_empty() {
+                        let extra: Vec<NodeId> = co_dsts[ki][ri]
+                            .clone()
+                            .iter()
+                            .filter_map(|d| r.resolve(x, y, d, aliases))
+                            .filter(|&n| n != dst_id && n != src_id)
+                            .collect();
+                        if !extra.is_empty() {
+                            r.claims.insert((x, y, ki as u8, ri as u32), extra);
+                        }
                     }
                     let edge = Edge {
                         to: dst_id,
@@ -235,44 +279,32 @@ impl Router {
         r
     }
 
-    /// Resolve `(x, y, name)` to a node id.
-    fn resolve(
-        &mut self,
-        x: u8,
-        y: u8,
-        name: &str,
-        aliases: &HashMap<(u8, u8, String), u32>,
-        io_map: &HashMap<(u8, u8, String), (u8, u8, String)>,
-    ) -> NodeId {
+    /// Resolve `(x, y, name)` to a node id; `None` for a span name the
+    /// tile does not have.
+    fn resolve(&mut self, x: u8, y: u8, name: &str, aliases: &HashMap<(u8, u8, String), u32>) -> Option<NodeId> {
         // Canonical global-network wires: every tile's glb_netwk_N is the
         // same physical net (IceStorm icebox_vlog joins them the same way).
         if let Some(n) = parse_glb_netwk(name) {
-            return self.glb_base + u32::from(n);
+            return Some(self.glb_base + u32::from(n));
         }
         // Neighbor-output wires are geometric aliases of the neighboring
         // tile's LC output (or IO input); see `neigh_op_alias`.
         if let Some((dx, dy, dname)) = neigh_op_alias(x, y, name) {
-            return self.resolve(dx, dy, &dname, aliases, io_map);
+            return self.resolve(dx, dy, &dname, aliases);
         }
-        // Span wire in the fabric?
-        if let Some(wid) = aliases.get(&(x, y, name.to_string())) {
-            return *wid;
-        }
-        // IO tile span -> fabric span?
-        if let Some((lx, ly, lname)) = io_map.get(&(x, y, name.to_string())) {
-            if let Some(wid) = aliases.get(&(*lx, *ly, lname.clone())) {
-                return *wid;
-            }
+        // Span wires, including IO-tile spans, are in the alias table.
+        if is_span(name) {
+            return aliases.get(&(x, y, name.to_string())).copied();
         }
         // Otherwise an interned tile-local node.
         let key = (x, y, name.to_string());
         if let Some(id) = self.node_ids.get(&key) {
-            return *id;
+            return Some(*id);
         }
         let id = self.glb_base + 8 + self.node_xy.len() as u32;
         self.node_ids.insert(key, id);
         self.node_xy.push((x, y));
-        id
+        Some(id)
     }
 
     pub fn node_count(&self) -> u32 {
@@ -323,89 +355,230 @@ impl Router {
         if let Some((dx, dy, dname)) = neigh_op_alias(x, y, name) {
             return self.lookup(dx, dy, &dname);
         }
-        let aliases = span_aliases();
-        if let Some(wid) = aliases.get(&(x, y, name.to_string())) {
-            return Some(*wid);
-        }
-        if let Some((lx, ly, lname)) = io_span_map().get(&(x, y, name.to_string())) {
-            if let Some(wid) = aliases.get(&(*lx, *ly, lname.clone())) {
-                return Some(*wid);
-            }
+        if is_span(name) {
+            return span_aliases().get(&(x, y, name.to_string())).copied();
         }
         self.node_ids.get(&(x, y, name.to_string())).copied()
     }
 
-    /// A* from `src` to `dst`. `forbidden` holds muxes already used by other
-    /// nets: `(tile_x, tile_y, dst_node)`. Returns the edge list.
-    fn astar(
-        &self,
-        src: NodeId,
-        dst: NodeId,
-        forbidden: &HashSet<(u8, u8, NodeId)>,
-    ) -> Option<Vec<Edge>> {
-        #[derive(Clone, Copy, PartialEq)]
-        struct State {
-            f: i64,
-            g: i64,
-            node: NodeId,
-        }
-        impl Eq for State {}
-        impl Ord for State {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other.f.cmp(&self.f).then_with(|| self.node.cmp(&other.node))
-            }
-        }
-        impl PartialOrd for State {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
+    /// Edges out of `n`.
+    fn edges_from(&self, n: NodeId) -> &[Edge] {
+        &self.adj[n as usize]
+    }
 
-        let (tx, ty) = self.node_pos(dst);
-        let h = |n: NodeId| -> i64 {
-            let (x, y) = self.node_pos(n);
-            ((x - tx).abs() + (y - ty).abs()) as i64
+    /// Nodes besides `e.to` that programming edge `e` also connects: other
+    /// DB entries of the same tile kind with exactly the same bit pattern
+    /// (the IceStorm IO-tile database lists one buffer bit under both a
+    /// horizontal and a vertical span name). Using `e` claims them too.
+    fn edge_claims(&self, e: &Edge) -> &[NodeId] {
+        match self.claims.get(&(e.tile_x, e.tile_y, e.kind_idx as u8, e.rel_idx as u32)) {
+            Some(v) => v,
+            None => &[],
+        }
+    }
+}
+
+/// Reusable search state for [`Negotiator::search`].
+struct Scratch {
+    g: Vec<f32>,
+    stamp: Vec<u32>,
+    prev: Vec<(NodeId, u32)>,
+    epoch: u32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct HeapItem {
+    f: f32,
+    g: f32,
+    node: NodeId,
+}
+impl Eq for HeapItem {}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.f.total_cmp(&self.f).then_with(|| self.node.cmp(&other.node))
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One net to route: driver node and load nodes.
+struct NetReq {
+    name: String,
+    driver: NodeId,
+    loads: Vec<NodeId>,
+}
+
+/// PathFinder-style negotiated congestion router (McMurchie & Ebeling).
+///
+/// Every wire (graph node) holds at most one net. Nets are routed one at a
+/// time against the present cost of wires other nets hold and a history
+/// cost that grows on wires that stay contended; nets on contended wires
+/// are ripped up and rerouted until no wire is shared. A net's tree grows
+/// from all of its already-reached wires (multi-source A*), so no wire is
+/// driven twice inside one net either.
+struct Negotiator<'a> {
+    router: &'a Router,
+    occ: Vec<u16>,
+    hist: Vec<f32>,
+    pres_fac: f32,
+    scratch: Scratch,
+}
+
+impl<'a> Negotiator<'a> {
+    fn new(router: &'a Router) -> Self {
+        let n = router.node_count() as usize;
+        Negotiator {
+            router,
+            occ: vec![0; n],
+            hist: vec![0.0; n],
+            pres_fac: 0.5,
+            scratch: Scratch { g: vec![0.0; n], stamp: vec![0; n], prev: vec![(0, 0); n], epoch: 0 },
+        }
+    }
+
+    /// Cost of claiming `n` for a net that does not hold it yet.
+    fn node_cost(&self, n: NodeId, owned: &HashSet<NodeId>) -> f32 {
+        if owned.contains(&n) {
+            return 0.0;
+        }
+        let i = n as usize;
+        (1.0 + self.hist[i]) * (1.0 + self.pres_fac * f32::from(self.occ[i]))
+    }
+
+    /// Cheapest path from any node of `tree` to `target`; returns its edges.
+    fn search(&mut self, tree: &[NodeId], owned: &HashSet<NodeId>, target: NodeId) -> Option<Vec<Edge>> {
+        let r = self.router;
+        self.scratch.epoch = self.scratch.epoch.wrapping_add(1);
+        if self.scratch.epoch == 0 {
+            self.scratch.stamp.iter_mut().for_each(|s| *s = 0);
+            self.scratch.epoch = 1;
+        }
+        let epoch = self.scratch.epoch;
+        let (tx, ty) = r.node_pos(target);
+        let h = |n: NodeId| -> f32 {
+            let (x, y) = r.node_pos(n);
+            0.5 * ((x - tx).abs() + (y - ty).abs()) as f32
         };
-
-        let n = self.node_count() as usize;
-        let mut g_score = vec![i64::MAX; n];
-        let mut came_from: Vec<Option<(NodeId, Edge)>> = vec![None; n];
         let mut heap = BinaryHeap::new();
-        g_score[src as usize] = 0;
-        heap.push(State { f: h(src), g: 0, node: src });
-
-        while let Some(State { g, node, .. }) = heap.pop() {
-            if node == dst {
-                // Reconstruct.
+        for &s in tree {
+            let si = s as usize;
+            self.scratch.stamp[si] = epoch;
+            self.scratch.g[si] = 0.0;
+            self.scratch.prev[si] = (s, u32::MAX);
+            heap.push(HeapItem { f: h(s), g: 0.0, node: s });
+        }
+        while let Some(HeapItem { g, node, .. }) = heap.pop() {
+            if node == target {
                 let mut edges = Vec::new();
-                let mut cur = dst;
-                while cur != src {
-                    let (prev, e) = came_from[cur as usize].clone()?;
-                    edges.push(e);
-                    cur = prev;
+                let mut cur = target;
+                loop {
+                    let (p, ei) = self.scratch.prev[cur as usize];
+                    if ei == u32::MAX {
+                        break;
+                    }
+                    edges.push(r.edges_from(p)[ei as usize].clone());
+                    cur = p;
                 }
                 edges.reverse();
                 return Some(edges);
             }
-            if g > g_score[node as usize] {
+            if self.scratch.stamp[node as usize] == epoch && g > self.scratch.g[node as usize] {
                 continue;
             }
-            for e in &self.adj[node as usize] {
-                // Congestion: using an already-used mux costs extra.
-                let congestion = if forbidden.contains(&(e.tile_x, e.tile_y, e.to)) {
-                    10_000
-                } else {
-                    0
-                };
-                let ng = g + 1 + congestion;
-                if ng < g_score[e.to as usize] {
-                    g_score[e.to as usize] = ng;
-                    came_from[e.to as usize] = Some((node, e.clone()));
-                    heap.push(State { f: ng + h(e.to), g: ng, node: e.to });
+            for (ei, e) in r.edges_from(node).iter().enumerate() {
+                let to = e.to as usize;
+                let mut c = self.node_cost(e.to, owned);
+                for &m in r.edge_claims(e) {
+                    c += self.node_cost(m, owned);
+                }
+                let ng = g + c;
+                if self.scratch.stamp[to] != epoch || ng < self.scratch.g[to] {
+                    self.scratch.stamp[to] = epoch;
+                    self.scratch.g[to] = ng;
+                    self.scratch.prev[to] = (node, ei as u32);
+                    heap.push(HeapItem { f: ng + h(e.to), g: ng, node: e.to });
                 }
             }
         }
         None
+    }
+
+    /// Route one net; returns its edges and every node it holds.
+    fn route_net(&mut self, net: &NetReq) -> Result<(Vec<Edge>, Vec<NodeId>), String> {
+        let mut owned: HashSet<NodeId> = HashSet::new();
+        owned.insert(net.driver);
+        let mut tree = vec![net.driver];
+        let mut edges = Vec::new();
+        let (dx, dy) = self.router.node_pos(net.driver);
+        let mut loads = net.loads.clone();
+        loads.sort_by_key(|&l| {
+            let (x, y) = self.router.node_pos(l);
+            ((x - dx).abs() + (y - dy).abs(), l)
+        });
+        loads.dedup();
+        for load in loads {
+            if owned.contains(&load) {
+                continue;
+            }
+            let path = self
+                .search(&tree, &owned, load)
+                .ok_or_else(|| format!("route: net '{}': no path to a load", net.name))?;
+            for e in &path {
+                if owned.insert(e.to) {
+                    tree.push(e.to);
+                }
+                for &m in self.router.edge_claims(e) {
+                    owned.insert(m);
+                }
+            }
+            edges.extend(path);
+        }
+        let mut nodes: Vec<NodeId> = owned.into_iter().collect();
+        nodes.sort_unstable();
+        Ok((edges, nodes))
+    }
+
+    /// Route all nets until no wire is shared.
+    fn run(&mut self, nets: &[NetReq]) -> Result<Vec<Vec<Edge>>, String> {
+        const MAX_ITERS: usize = 80;
+        let mut routes: Vec<Option<(Vec<Edge>, Vec<NodeId>)>> = vec![None; nets.len()];
+        for iter in 0..MAX_ITERS {
+            for (i, net) in nets.iter().enumerate() {
+                if let Some((_, nodes)) = &routes[i] {
+                    if nodes.iter().all(|&n| self.occ[n as usize] <= 1) {
+                        continue;
+                    }
+                    for &n in nodes {
+                        self.occ[n as usize] -= 1;
+                    }
+                }
+                let (edges, nodes) = self.route_net(net)?;
+                for &n in &nodes {
+                    self.occ[n as usize] += 1;
+                }
+                routes[i] = Some((edges, nodes));
+            }
+            let mut shared = 0usize;
+            for (i, o) in self.occ.iter().enumerate() {
+                if *o > 1 {
+                    shared += 1;
+                    self.hist[i] += 0.3 * f32::from(*o - 1);
+                }
+            }
+            if shared == 0 {
+                return Ok(routes.into_iter().map(|r| r.map(|(e, _)| e).unwrap_or_default()).collect());
+            }
+            if iter + 1 == MAX_ITERS {
+                return Err(format!(
+                    "route: congestion not resolved after {MAX_ITERS} negotiation passes: {shared} wire(s) still wanted by more than one net"
+                ));
+            }
+            self.pres_fac *= 1.5;
+        }
+        unreachable!()
     }
 }
 
@@ -850,84 +1023,64 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
         }
     }
 
-    // Route each net: driver -> all loads via a shared tree.
-    let mut routed = Vec::new();
-    let mut forbidden: HashSet<(u8, u8, NodeId)> = HashSet::new();
-    // Sort nets by load count descending (big nets first).
-    let mut nets: Vec<(String, Vec<Endpoint>)> = net_eps.into_iter().collect();
-    nets.sort_by_key(|(_, eps)| std::cmp::Reverse(eps.iter().filter(|e| !e.is_driver).count()));
-
-    for (name, eps) in nets {
-        let drivers: Vec<NodeId> = eps.iter().filter(|e| e.is_driver).map(|e| e.node).collect();
-        let loads: Vec<NodeId> = eps.iter().filter(|e| !e.is_driver).map(|e| e.node).collect();
+    // Route every net with negotiated congestion: no wire carries two nets.
+    let mut reqs: Vec<NetReq> = Vec::new();
+    let mut names: Vec<(String, Vec<NodeId>)> = net_eps
+        .into_iter()
+        .map(|(n, eps)| {
+            let mut v: Vec<NodeId> = eps.iter().filter(|e| e.is_driver).map(|e| e.node).collect();
+            v.push(u32::MAX);
+            v.extend(eps.iter().filter(|e| !e.is_driver).map(|e| e.node));
+            (n, v)
+        })
+        .collect();
+    // Big nets first, then by name: deterministic.
+    names.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    for (name, v) in names {
+        let split = v.iter().position(|&n| n == u32::MAX).unwrap_or(0);
+        let drivers: Vec<NodeId> = v[..split].to_vec();
+        let loads: Vec<NodeId> = v[split + 1..].to_vec();
         // A global clock net is driven by its canonical glb_netwk wire
         // (the source reached it via the global buffer / padin bit); a
         // fabric driver on the same net is a design bug.
-        let drivers = if let Some(&pi) = net_plan.get(&name) {
+        let driver = if let Some(&pi) = net_plan.get(&name) {
             if !drivers.is_empty() {
                 return Err(format!(
                     "route: global clock net '{name}' has {} fabric drivers",
                     drivers.len()
                 ));
             }
-            vec![router.glb_node(plans[pi].glb)]
+            router.glb_node(plans[pi].glb)
         } else {
-            if drivers.is_empty() {
-                return Err(format!("route: net '{name}' has no driver"));
+            match drivers[..] {
+                [] => return Err(format!("route: net '{name}' has no driver")),
+                [d] => d,
+                _ => return Err(format!("route: net '{name}' has {} drivers", drivers.len())),
             }
-            if drivers.len() > 1 {
-                return Err(format!("route: net '{name}' has {} drivers", drivers.len()));
-            }
-            drivers
         };
         if loads.is_empty() {
             continue; // no loads: nothing to route
         }
-        let driver = drivers[0];
-        // Iterative tree: keep a set of reached nodes; route each load from
-        // the nearest reached node.
-        let mut reached: HashSet<NodeId> = HashSet::new();
-        reached.insert(driver);
-        let mut tree_edges: Vec<Edge> = Vec::new();
-        // Route loads nearest-first for a better tree.
-        let mut remaining = loads.clone();
-        while !remaining.is_empty() {
-            // Find the (load, source) pair with the shortest path.
-            let mut best: Option<(usize, NodeId, Vec<Edge>)> = None;
-            for (i, &load) in remaining.iter().enumerate() {
-                if reached.contains(&load) {
-                    best = Some((i, load, Vec::new()));
-                    break;
-                }
-                // Try routing from the driver; then from tree nodes.
-                // (Full nearest-tree search is O(L*T); driver-first is fine.)
-                let sources: Vec<NodeId> = reached.iter().copied().collect();
-                for src in sources {
-                    if let Some(path) = router.astar(src, load, &forbidden) {
-                        let better = best.as_ref().map(|(_, _, p)| path.len() < p.len()).unwrap_or(true);
-                        if better {
-                            best = Some((i, src, path));
-                        }
-                        break; // first reached source is fine (driver usually)
-                    }
-                }
-                if best.is_some() {
-                    break;
+        reqs.push(NetReq { name, driver, loads });
+    }
+    let mut neg = Negotiator::new(router);
+    let edge_lists = neg.run(&reqs)?;
+    if let Ok(want) = std::env::var("HELION_ICE40_ROUTE_DUMP") {
+        for (req, edges) in reqs.iter().zip(&edge_lists) {
+            if req.name.contains(&want) {
+                eprintln!("net {}:", req.name);
+                for e in edges {
+                    eprintln!("  ({},{}) {} -> {}", e.tile_x, e.tile_y, router.rel_src(e.kind_idx, e.rel_idx), router.rel_dst(e.kind_idx, e.rel_idx));
                 }
             }
-            let (li, _src, path) = best
-                .ok_or_else(|| format!("route: net '{name}': no path to load"))?;
-            let load = remaining.remove(li);
-            for e in &path {
-                forbidden.insert((e.tile_x, e.tile_y, e.to));
-                reached.insert(e.to);
-            }
-            reached.insert(load);
-            tree_edges.extend(path);
         }
-        routed.push(RoutedNet {
-            name,
-            edges: tree_edges
+    }
+    let routed: Vec<RoutedNet> = reqs
+        .into_iter()
+        .zip(edge_lists)
+        .map(|(req, edges)| RoutedNet {
+            name: req.name,
+            edges: edges
                 .into_iter()
                 .map(|e| RoutedEdge {
                     tile_x: e.tile_x,
@@ -936,8 +1089,8 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
                     rel_idx: e.rel_idx,
                 })
                 .collect(),
-        });
-    }
+        })
+        .collect();
 
     let mut glb_clocks: Vec<GlbClock> = Vec::new();
     for (i, p) in plans.iter().enumerate() {
@@ -993,10 +1146,13 @@ mod tests {
 
     #[test]
     fn neigh_op_alias_rejects_unrepresentable_drivers() {
-        // Off-chip and RAM-neighbor drivers stay unaliased (dead nodes,
-        // like the old exclusion): no panic, no bogus tile.
+        // Off-chip drivers stay unaliased (dead nodes): no panic, no bogus tile.
         assert_eq!(neigh_op_alias(5, 0, "neigh_op_bot_0"), None);
-        assert_eq!(neigh_op_alias(7, 5, "neigh_op_rgt_0"), None); // (8,5) is RAMB
+        // RAM neighbor: icebox lookup_funcnet's RDATA mapping.
+        assert_eq!(neigh_op_alias(7, 5, "neigh_op_rgt_0"), Some((8, 5, "ram/RDATA_15".to_string())));
+        assert_eq!(neigh_op_alias(7, 6, "neigh_op_rgt_2"), Some((8, 6, "ram/RDATA_5".to_string())));
+        // An IO tile's logic_op_ wires never come from another IO tile.
+        assert_eq!(neigh_op_alias(1, 33, "logic_op_bnl_0"), None);
         assert_eq!(neigh_op_alias(5, 5, "neigh_op_xx_0"), None);
         assert_eq!(neigh_op_alias(5, 5, "slf_op_0"), None);
         // IO-tile neighbor: logic_op_ aliases to the logic LC output.

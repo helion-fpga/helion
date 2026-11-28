@@ -1,0 +1,11 @@
+# Lattice iCE40-HX8K breakout board (ICE40HX8K-B-EVN), package CT256.
+# Clock and LED pins as used by the IceStorm/nextpnr HX8K examples.
+set_io clk    J3   # 12 MHz oscillator
+set_io led[0] B5   # D2
+set_io led[1] B4   # D3
+set_io led[2] A2   # D4
+set_io led[3] A1   # D5
+set_io led[4] C5   # D6
+set_io led[5] C4   # D7
+set_io led[6] B3   # D8
+set_io led[7] C3   # D9

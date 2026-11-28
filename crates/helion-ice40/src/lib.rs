@@ -11,7 +11,9 @@ pub mod db;
 pub mod device;
 pub mod flow;
 pub mod gclk;
+pub mod io;
 pub mod pack;
+pub mod pcf;
 pub mod place;
 pub mod route;
 

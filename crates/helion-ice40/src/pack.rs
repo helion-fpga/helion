@@ -548,37 +548,26 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                     clk_net: need("CLK")?,
                 });
             }
-            CellKind::IobOut => {
+            CellKind::IobOut | CellKind::IobIn => {
+                let cname = resolve(cell.name);
+                let out_dir = matches!(cell.kind, CellKind::IobOut);
+                let (fabric_pin, what) = if out_dir { ("I", "OBUF") } else { ("O", "IBUF") };
                 let net = resolve(pins
-                    .net_on(resolve(cell.name), "I")
-                    .ok_or_else(|| format!("pack: OBUF {} has no I net", resolve(cell.name)))?)
+                    .net_on(cname, fabric_pin)
+                    .ok_or_else(|| format!("pack: {what} {cname} has no {fabric_pin} net"))?)
                 .to_string();
-                let port = resolve(pins
-                    .net_on(resolve(cell.name), "PAD")
-                    .unwrap_or(cell.name))
-                .to_string();
+                let port = crate::io::io_port_name(netlist, cname).unwrap_or_else(|| cname.to_string());
+                // A LOC on the IO cell (set from a PCF by io::bind_pcf) wins
+                // over the port's LOC and the breakout-board naming.
+                let pin = match cell.attrs.get("LOC") {
+                    Some(loc) => loc.to_string(),
+                    None => resolve_pin(netlist, &port)?,
+                };
                 out.ios.push(PackedIo {
-                    name: resolve(cell.name).to_string(),
-                    pin: resolve_pin(netlist, &port)?,
+                    name: cname.to_string(),
+                    pin,
                     port,
-                    dir: IoDir::Out,
-                    net,
-                });
-            }
-            CellKind::IobIn => {
-                let net = resolve(pins
-                    .net_on(resolve(cell.name), "O")
-                    .ok_or_else(|| format!("pack: IBUF {} has no O net", resolve(cell.name)))?)
-                .to_string();
-                let port = resolve(pins
-                    .net_on(resolve(cell.name), "PAD")
-                    .unwrap_or(cell.name))
-                .to_string();
-                out.ios.push(PackedIo {
-                    name: resolve(cell.name).to_string(),
-                    pin: resolve_pin(netlist, &port)?,
-                    port,
-                    dir: IoDir::In,
+                    dir: if out_dir { IoDir::Out } else { IoDir::In },
                     net,
                 });
             }
