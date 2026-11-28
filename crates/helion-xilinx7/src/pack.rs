@@ -906,8 +906,80 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
     prepare_prim_carries(&mut out);
     insert_clock_spine(netlist, &mut out)?;
     insert_input_buffers(netlist, &mut out)?;
+    assign_lut_pins(&mut out);
 
     Ok(out)
+}
+
+/// Put every LUT's inputs on its fastest pins (A6 is 22 ps, A1 540 ps:
+/// `timing::LUT_PIN_PS`), the deepest input on the fastest pin. Packed input
+/// k is physical pin k+1 everywhere downstream (timer, router, emit), so the
+/// move happens here once. A LUT whose O5 is read (a dual LUT, or a carry S
+/// LUT whose xCY0 DI is O5) keeps A6 unconnected, reading 1.
+fn assign_lut_pins(packed: &mut Packed7) {
+    use std::collections::HashMap;
+    // shortcut: criticality is LUT depth from pack, not post-placement slack;
+    // carry and RAM outputs count as depth 0. Upgrade with a timed re-pin before routing.
+    let n = packed.luts.len();
+    let drv: HashMap<&str, usize> = packed.luts.iter().enumerate().map(|(i, l)| (l.output_net.as_str(), i)).collect();
+    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut pending = vec![0usize; n];
+    for (i, l) in packed.luts.iter().enumerate() {
+        for &j in l.input_nets.iter().flatten().filter_map(|x| drv.get(x.as_str())) {
+            readers[j].push(i);
+            pending[i] += 1;
+        }
+    }
+    let mut depth = vec![0u32; n];
+    let mut ready: Vec<usize> = (0..n).filter(|&i| pending[i] == 0).collect();
+    while let Some(j) = ready.pop() {
+        for &i in &readers[j] {
+            depth[i] = depth[i].max(depth[j] + 1);
+            pending[i] -= 1;
+            if pending[i] == 0 {
+                ready.push(i);
+            }
+        }
+    }
+    let net_depth = |x: &str| drv.get(x).map_or(0, |&j| depth[j] + 1);
+    let s_nets: HashSet<&str> = packed.carries.iter().flat_map(|c| c.s_nets.iter().flatten()).map(|s| s.as_str()).collect();
+    let plans: Vec<(usize, Vec<usize>, usize)> = packed
+        .luts
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let free = if packed.dual_luts.contains(&l.name) || s_nets.contains(l.output_net.as_str()) { 5 } else { 6 };
+            let mut order: Vec<usize> = (0..6).filter(|&p| l.input_nets[p].is_some()).collect();
+            order.sort_by_key(|&p| net_depth(l.input_nets[p].as_deref().unwrap()));
+            (i, order, free)
+        })
+        .filter(|(_, order, free)| order.len() <= *free)
+        .collect();
+    for (i, order, free) in plans {
+        move_lut_pins(&mut packed.luts[i], &order, free);
+    }
+}
+
+/// Move `lut`'s connected pins `order` (least critical first) onto pins
+/// `free - order.len()` .. `free - 1`, rewriting INIT to the same function
+/// with an unconnected pin reading 1. With `free == 5`, A6 stays
+/// unconnected: O6 (A6 = 1) and O5 (A6 = 0) both keep their function.
+fn move_lut_pins(lut: &mut PackedLut, order: &[usize], free: usize) {
+    let to = free - order.len()..free;
+    let mut init = 0u64;
+    for a in 0..64u64 {
+        let mut old = if free == 5 { 0x1f | (a & 0x20) } else { 0x3f };
+        for (&p, q) in order.iter().zip(to.clone()) {
+            old = (old & !(1 << p)) | (((a >> q) & 1) << p);
+        }
+        init |= ((lut.init >> old) & 1) << a;
+    }
+    let mut nets: [Option<String>; 6] = Default::default();
+    for (&p, q) in order.iter().zip(to) {
+        nets[q] = lut.input_nets[p].take();
+    }
+    lut.input_nets = nets;
+    lut.init = init;
 }
 
 fn pack_blackbox_primitive(
@@ -3870,7 +3942,8 @@ mod tests {
         // S0 is not driven by a LUT: it reaches the carry through a pass-through LUT (G13).
         assert_eq!(c0.s_nets[0].as_deref(), Some("u_c0_s0_rt"));
         let rt = packed.luts.iter().find(|l| l.name == "u_c0_s0_rt").unwrap();
-        assert_eq!(rt.input_nets[0].as_deref(), Some("s0"));
+        // A carry S LUT keeps A6 free (its O5 can be the DI): its input sits on A5.
+        assert_eq!(rt.input_nets[4].as_deref(), Some("s0"));
         assert_eq!(c0.di_nets[3].as_deref(), Some("zero"));
         assert_eq!(c0.o_nets[2].as_deref(), Some("o2"));
         let c1 = &packed.carries[1];
@@ -3930,10 +4003,11 @@ mod tests {
         let packed = pack(&arst_design("0")).unwrap();
         assert_eq!(packed.luts.len(), 1);
         let inv = &packed.luts[0];
-        assert_eq!(inv.input_nets[0].as_deref(), Some("rst"));
-        // Output is the complement of I0 whatever the unused pins read.
+        // A lone input rides the fastest pin, A6.
+        assert_eq!(inv.input_nets[5].as_deref(), Some("rst"));
+        // Output is the complement of I5 whatever the unused pins read.
         for addr in 0..64u64 {
-            assert_eq!((inv.init >> addr) & 1, 1 - (addr & 1));
+            assert_eq!((inv.init >> addr) & 1, 1 - (addr >> 5 & 1));
         }
         for ff in &packed.ffs {
             assert_eq!(ff.sr_net.as_deref(), Some(inv.output_net.as_str()));
@@ -3980,5 +4054,57 @@ mod tests {
         let packed = pack(&d).unwrap();
         assert!(packed.negedge_ffs.contains("r1_reg"));
         assert!(!packed.negedge_ffs.contains("r0_reg"));
+    }
+
+    /// Moving a LUT's inputs to its top pins keeps O6 (and O5 when A6 must
+    /// stay free) for every input count, pin subset and order.
+    #[test]
+    fn moved_lut_pins_keep_the_function() {
+        // Output for net values `v` (bit k: net `nk`), unconnected pins reading 1 but A6 = `a6`.
+        let eval = |l: &PackedLut, v: u64, a6: u64| {
+            let addr = (0..6).fold(0u64, |addr, i| {
+                let bit = match &l.input_nets[i] {
+                    Some(x) => (v >> x[1..].parse::<u64>().unwrap()) & 1,
+                    None if i == 5 => a6,
+                    None => 1,
+                };
+                addr | bit << i
+            });
+            (l.init >> addr) & 1
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for free in [5, 6] {
+            for n in 0..=free {
+                for _ in 0..40 {
+                    // n distinct pins below `free`, in a random order.
+                    let mut pins: Vec<usize> = (0..free).collect();
+                    for k in (1..free).rev() {
+                        pins.swap(k, rnd() as usize % (k + 1));
+                    }
+                    let order = &pins[..n];
+                    let mut lut = PackedLut { name: "l".into(), init: rnd(), input_nets: Default::default(), output_net: "o".into() };
+                    for (k, &p) in order.iter().enumerate() {
+                        lut.input_nets[p] = Some(format!("n{k}"));
+                    }
+                    let before = lut.clone();
+                    move_lut_pins(&mut lut, order, free);
+                    for (k, q) in (free - n..free).enumerate() {
+                        assert_eq!(lut.input_nets[q].as_deref(), Some(format!("n{k}").as_str()), "free {free} n {n}");
+                    }
+                    assert_eq!(lut.input_nets.iter().flatten().count(), n);
+                    for v in 0..(1u64 << n) {
+                        for a6 in if free == 5 { 0..2 } else { 1..2 } {
+                            assert_eq!(eval(&lut, v, a6), eval(&before, v, a6), "free {free} n {n} order {order:?} v {v} a6 {a6}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
