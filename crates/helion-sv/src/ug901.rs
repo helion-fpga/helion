@@ -13,9 +13,9 @@ use bumpalo::Bump;
 use helion_ir::{resolve, CellKind, Design};
 
 use crate::{
-    addr_match_expr, bit_name, care_mask, clog2_u, emit_small_lut, normalize_mul_operands,
-    sig_depth, sig_width, simple_word_enable, str_param_hash, unpacked_word_q, word_ce_mux, Aig,
-    Expr, RExpr, Rtl, Signal, Tok,
+    addr_match_expr, bit_name, care_mask, clog2_u, emit_carry4_add_buses, emit_small_lut,
+    lut6_from_i012, normalize_mul_operands, sig_depth, sig_width, simple_word_enable,
+    str_param_hash, unpacked_word_q, word_ce_mux, Aig, Expr, RExpr, Rtl, Signal, Tok,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1381,6 +1381,280 @@ fn extract_add_sub_operands<'a>(e: &RExpr<'a>) -> Option<(&'a str, &'a str, Opti
     }
 }
 
+/// G126: Vivado DSP inference threshold (UG902 v2020.1 Table 15, p.170).
+/// "Multiplications which are >= 10 bits are implemented on a DSP48 macro
+/// cell. Multiplication lower than this limit are implemented using LUTs."
+/// A multiply is at least 10 bits when its wider operand is at least 10
+/// bits, so DSP iff max(wa, wb) >= 10 and both operands below 10 go to LUTs.
+const VIVADO_DSP_MIN_BITS: usize = 10;
+
+/// G126: match an exact small multiply (bare `a * b`) or an exact single
+/// multiply-accumulate (`a * b + c` / `c + a * b`) whose operands are plain
+/// idents, and return (a, wa, b, wb, c_opt) when the multiply is below the
+/// Vivado DSP threshold and the output fits the product (and `c`) width.
+/// Returns None for anything else: ranged/bit/constant operands, mux-wrapped
+/// multiplies, subtractions, sums of products, and multiplies at or above
+/// the threshold. No mux peeling and no operand normalization: a multiply
+/// hidden behind clear/enable logic keeps the DSP path it has today.
+/// The width checks keep the LUT lowering exact without signedness info:
+/// the low out_w bits of a product need only the low out_w bits of the
+/// operands, and the LUT path computes the same unsigned product the DSP
+/// sim model computes, so signedness is irrelevant here.
+fn small_mul_parts<'a>(
+    rhs: &'a RExpr<'a>,
+    wmap: &HashMap<&'a str, usize>,
+    out_w: usize,
+) -> Option<(&'a str, usize, &'a str, usize, Option<(&'a str, usize)>)> {
+    fn ident_w<'a>(
+        e: &'a RExpr<'a>,
+        wmap: &HashMap<&'a str, usize>,
+    ) -> Option<(&'a str, usize)> {
+        if let RExpr::Ident(s) = e {
+            let w = wmap.get(s).copied().unwrap_or(0);
+            if w > 0 {
+                return Some((*s, w));
+            }
+        }
+        None
+    }
+    let (a_e, b_e, c_e): (&'a RExpr<'a>, &'a RExpr<'a>, Option<&'a RExpr<'a>>) = match rhs {
+        RExpr::Mul(x, y) => (x, y, None),
+        RExpr::Add(l, r) => {
+            if let RExpr::Mul(x, y) = *l {
+                (x, y, Some(*r))
+            } else if let RExpr::Mul(x, y) = *r {
+                (x, y, Some(*l))
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let (an, wa) = ident_w(a_e, wmap)?;
+    let (bn, wb) = ident_w(b_e, wmap)?;
+    if wa.max(wb) >= VIVADO_DSP_MIN_BITS {
+        return None;
+    }
+    if out_w == 0 || out_w > wa + wb {
+        return None;
+    }
+    let c_part = match c_e {
+        None => None,
+        Some(c) => {
+            let (cn, wc) = ident_w(c, wmap)?;
+            if out_w > wc {
+                return None;
+            }
+            Some((cn, wc))
+        }
+    };
+    Some((an, wa, bn, wb, c_part))
+}
+
+/// G126: Carry4-based array multiplier for small unsigned products, the low
+/// `out_w` bits of `a * b` (requires `out_w <= wa + wb`). Row 0 is one AND
+/// LUT per partial-product bit; each later row adds its partial-product row
+/// into the running sum with one S LUT per bit (the AND folded into the
+/// carry-chain S input, `S = sum ^ (a & b)`) and Carry4 cells for the carry.
+/// Cost is one LUT per partial-product bit: an 8x8 multiply is 64 LUTs plus
+/// 14 Carry4 cells, matching Vivado's 61-71 LUTs for an 8x8 LUT multiplier,
+/// where the LUT6-only array multiplier needs 128 LUTs. When `clk_opt` is
+/// set, the product bits are registered into HFFs driving `lhs` (NBA case);
+/// otherwise the product bits drive `lhs` directly (assign case).
+fn emit_carry4_array_multiplier(
+    d: &mut Design,
+    a_sig: &str,
+    wa: usize,
+    b_sig: &str,
+    wb: usize,
+    lhs: &str,
+    out_w: usize,
+    clk_opt: Option<&str>,
+) {
+    const AND2_INIT: u64 = 0x8888_8888_8888_8888;
+    let wa = wa.max(1).min(16);
+    let wb = wb.max(1).min(16);
+    let out_w = out_w.max(1).min(32);
+    let s_init = lut6_from_i012(|s, a, b| s ^ (a & b));
+    let last_row = wb.min(out_w).saturating_sub(1);
+    let mut prod_nets: Vec<String> = Vec::with_capacity(out_w);
+    // row_sums[t] is the running-sum net at column (j - 1) + t before row j
+    // is processed (row 0 builds it; later rows rebuild it each iteration).
+    let mut row_sums: Vec<String> = Vec::with_capacity(wa + 1);
+    for j in 0..wb {
+        let nbits = wa.min(out_w.saturating_sub(j));
+        if nbits == 0 {
+            break;
+        }
+        let is_last = j == last_row;
+        if j == 0 {
+            let b0 = bit_name(b_sig, wb, 0);
+            for i in 0..nbits {
+                let ai = bit_name(a_sig, wa, i);
+                let snet = if clk_opt.is_none() && (i == 0 || is_last) {
+                    bit_name(lhs, out_w, i)
+                } else {
+                    format!("u_cmul_{lhs}_r0_{i}")
+                };
+                let cell = format!("u_cmul_pp_{lhs}_0_{i}");
+                d.add_cell(&cell, CellKind::Lut6 { init: AND2_INIT });
+                let _ = d.dont_touch(&cell);
+                d.connect(&ai, &cell, "I0");
+                d.connect(&b0, &cell, "I1");
+                d.connect(&snet, &cell, "O");
+                row_sums.push(snet.clone());
+                if i == 0 {
+                    prod_nets.push(snet);
+                }
+            }
+            continue;
+        }
+        // Rows 1..wb: add the partial-product row into the running sum.
+        let bj = bit_name(b_sig, wb, j);
+        // S LUTs: S[t] = row_sums[t+1] ^ (a[t] & b[j]).
+        let mut s_nets: Vec<String> = Vec::with_capacity(nbits);
+        for t in 0..nbits {
+            let ai = bit_name(a_sig, wa, t);
+            let snet = format!("n_cmul_{lhs}_s{j}_{t}");
+            let scell = format!("u_cmul_sum_{lhs}_{j}_{t}");
+            d.add_cell(&scell, CellKind::Lut6 { init: s_init });
+            let _ = d.dont_touch(&scell);
+            if let Some(acc) = row_sums.get(t + 1) {
+                d.connect(acc, &scell, "I0");
+            }
+            d.connect(&ai, &scell, "I1");
+            d.connect(&bj, &scell, "I2");
+            d.connect(&snet, &scell, "O");
+            s_nets.push(snet);
+        }
+        // Carry-out of this row, if its column is still inside the output.
+        let cout_opt: Option<String> = if j + nbits < out_w {
+            Some(if clk_opt.is_none() && is_last {
+                bit_name(lhs, out_w, j + nbits)
+            } else {
+                format!("n_cmul_{lhs}_cout{j}")
+            })
+        } else {
+            None
+        };
+        // Carry4 chain over the nbits sum bits.
+        let mut next_row: Vec<String> = Vec::with_capacity(nbits + 1);
+        let mut carry_in: Option<String> = None;
+        let n_chunks = (nbits + 3) / 4;
+        for chunk in 0..n_chunks {
+            let base = chunk * 4;
+            let cell = format!("u_cmul_c4_{lhs}_{j}_{chunk}");
+            d.add_cell(&cell, CellKind::Carry4);
+            if let Some(ci_net) = &carry_in {
+                d.connect(ci_net, &cell, "CI");
+            }
+            for i in 0..4 {
+                let t = base + i;
+                if t >= nbits {
+                    break;
+                }
+                let col = j + t;
+                if let Some(acc) = row_sums.get(t + 1) {
+                    d.connect(acc, &cell, &format!("DI{i}"));
+                }
+                d.connect(&s_nets[t], &cell, &format!("S{i}"));
+                let onet = if clk_opt.is_none() && (t == 0 || is_last) {
+                    bit_name(lhs, out_w, col)
+                } else {
+                    format!("n_cmul_{lhs}_o{j}_{t}")
+                };
+                d.connect(&onet, &cell, &format!("O{i}"));
+                next_row.push(onet.clone());
+                if t == 0 {
+                    prod_nets.push(onet);
+                }
+            }
+            if chunk + 1 == n_chunks {
+                // Last chunk: the carry-out is CO of the last used slot.
+                if let Some(cout) = &cout_opt {
+                    let co_pin = format!("CO{}", (nbits - 1) % 4);
+                    d.connect(cout, &cell, &co_pin);
+                }
+            } else {
+                let co_net = format!("n_cmul_{lhs}_co{j}_{chunk}");
+                d.connect(&co_net, &cell, "CO3");
+                carry_in = Some(co_net);
+            }
+        }
+        if let Some(cout) = cout_opt {
+            next_row.push(cout);
+        }
+        row_sums = next_row;
+    }
+    // Tail (registered case only): the remaining running-sum bits are the
+    // high product bits. In the combinational case they were connected
+    // directly to `lhs` by the last row.
+    if clk_opt.is_some() {
+        for (t, net) in row_sums.iter().enumerate().skip(1) {
+            let col = last_row + t;
+            if col < out_w {
+                prod_nets.push(net.clone());
+            }
+        }
+    }
+    if let Some(clk) = clk_opt {
+        for (k, pnet) in prod_nets.iter().take(out_w).enumerate() {
+            let qnet = bit_name(lhs, out_w, k);
+            let ff = format!("u_cmul_ff_{lhs}_{k}");
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect(clk, &ff, "CLK");
+            d.connect(pnet, &ff, "D");
+            d.connect(&qnet, &ff, "Q");
+        }
+    }
+}
+
+/// G126: emit a small multiply (or multiply-accumulate) as LUTs.
+/// Bare multiply: a Carry4 array multiplier. Multiply-accumulate: the
+/// product into temp nets, then a Carry4 add of `c`. A clocked (NBA) MAC
+/// registers the sum once, so it stays a single register stage like the
+/// DSP PREG it replaces. Returns false if the add could not be emitted,
+/// in which case the caller must leave the assignment on the DSP path.
+fn emit_small_mul_lut(
+    d: &mut Design,
+    a: &str,
+    wa: usize,
+    b: &str,
+    wb: usize,
+    c_opt: Option<(&str, usize)>,
+    lhs: &str,
+    out_w: usize,
+    clk_opt: Option<&str>,
+) -> bool {
+    match c_opt {
+        None => {
+            emit_carry4_array_multiplier(d, a, wa, b, wb, lhs, out_w, clk_opt);
+            true
+        }
+        Some((c, wc)) => {
+            let tmp_prod = format!("u_macl_{lhs}");
+            emit_carry4_array_multiplier(d, a, wa, b, wb, &tmp_prod, out_w, None);
+            match clk_opt {
+                None => emit_carry4_add_buses(d, lhs, out_w, &tmp_prod, out_w, c, wc),
+                Some(clk) => {
+                    let tmp_sum = format!("u_macs_{lhs}");
+                    if !emit_carry4_add_buses(d, &tmp_sum, out_w, &tmp_prod, out_w, c, wc) {
+                        return false;
+                    }
+                    for k in 0..out_w {
+                        let ff = format!("u_macl_ff_{lhs}_{k}");
+                        d.add_cell(&ff, CellKind::Hff);
+                        d.connect(clk, &ff, "CLK");
+                        d.connect(&bit_name(&tmp_sum, out_w, k), &ff, "D");
+                        d.connect(&bit_name(lhs, out_w, k), &ff, "Q");
+                    }
+                    true
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn apply_ug901_dsp_pass<'a>(
     rtl: &mut Rtl<'a>,
     d: &mut Design,
@@ -1421,6 +1695,19 @@ pub(crate) fn apply_ug901_dsp_pass<'a>(
                 no_dsp_nbas.insert(*lhs);
             }
         }
+        // G126: small multiplies with no explicit `use_dsp` go to LUTs
+        // (Vivado DSP threshold), not to a DSP block. Only exact
+        // whole-vector bare multiplies and single multiply-accumulates
+        // with plain ident operands; anything else keeps the DSP path.
+        if mode.is_none() && bit.is_none() {
+            if let Some(&out_w) = wmap.get(lhs) {
+                if let Some((a, wa, b, wb, c_opt)) = small_mul_parts(rhs, &wmap, out_w) {
+                    if emit_small_mul_lut(d, a, wa, b, wb, c_opt, lhs, out_w, Some(clk)) {
+                        no_dsp_nbas.insert(*lhs);
+                    }
+                }
+            }
+        }
     }
     if !no_dsp_nbas.is_empty() {
         rtl.nbas.retain(|(lhs, _, _)| !no_dsp_nbas.contains(lhs));
@@ -1445,6 +1732,19 @@ pub(crate) fn apply_ug901_dsp_pass<'a>(
                 };
                 d.attrs.set("USE_DSP", tag);
                 no_dsp_assigns.insert(*lhs);
+            }
+        }
+        // G126: small multiplies with no explicit `use_dsp` go to LUTs
+        // (Vivado DSP threshold), not to a DSP block. Only exact
+        // whole-vector bare multiplies and single multiply-accumulates
+        // with plain ident operands; anything else keeps the DSP path.
+        if mode.is_none() {
+            if let Some(&out_w) = wmap.get(lhs) {
+                if let Some((a, wa, b, wb, c_opt)) = small_mul_parts(rhs, &wmap, out_w) {
+                    if emit_small_mul_lut(d, a, wa, b, wb, c_opt, lhs, out_w, None) {
+                        no_dsp_assigns.insert(*lhs);
+                    }
+                }
             }
         }
     }
