@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Solve clock-tile PIP bits from clkfuzz.tcl specimens (prjxray segmatch style).
 
-  clksolve.py <specdir> <tilegrid.json> <xray-db-dir> [--types T1,T2] [--min-on N]
+  clksolve.py <specdir> <tilegrid.json> <xray-db-dir> [--types T1,T2] [--min-on N] [--mask-shared]
   clksolve.py selftest
 
 One sample = one tile of a tracked type in one specimen: its set config bits
@@ -45,14 +45,27 @@ def tile_bits(frames, b):
                 bit = (v & -v).bit_length() - 1
                 v &= v - 1
                 if not (w == ECC_WORD and bit < ECC_BITS):
-                    out.add(f"{minor:02d}_{(w - off) * 32 + bit}")
+                    out.add(f"{minor:02d}_{(w - off) * 32 + bit:02d}")  # X-Ray pads: 26_08
     return out
 
 
-def load_samples(specdir, grid, types):
+def shared_words(grid, tiles):
+    """{tile: {(minor, word - offset)}} for words another tile's segment also covers."""
+    segs = [(t, int(x["baseaddr"], 16), x["frames"], x["offset"], x["words"]) for t, tv in grid.items() for x in tv.get("bits", {}).values()]
+    out = {}
+    for t, v in tiles.items():
+        b = v["bits"]["CLB_IO_CLK"]
+        base, off = int(b["baseaddr"], 16), b["offset"]
+        out[t] = {(m, w - off) for m in range(b["frames"]) for w in range(off, off + b["words"])
+                  if any(o != t and ba <= base + m < ba + n and oo <= w < oo + nw for o, ba, n, oo, nw in segs)}
+    return out
+
+
+def load_samples(specdir, grid, types, mask_shared=False):
     import bitframes
     import gzip
     tiles = {k: v for k, v in grid.items() if v["type"] in types and "CLB_IO_CLK" in v.get("bits", {})}
+    shared = shared_words(grid, tiles) if mask_shared else {}
     samples = []  # (type, bits, tags)
     for pf in sorted(glob.glob(os.path.join(specdir, "spec_*.pips.tsv*"))):
         sid = os.path.basename(pf).split(".")[0]
@@ -67,7 +80,10 @@ def load_samples(specdir, grid, types):
                 used[f[1]].add(pip_tag(f[3])[1])
         _, frames = bitframes.frames(bf)
         for t, v in tiles.items():
-            samples.append((v["type"], tile_bits(frames, v["bits"]["CLB_IO_CLK"]), used[t] - {None}))
+            bits = tile_bits(frames, v["bits"]["CLB_IO_CLK"])
+            if shared.get(t):
+                bits = {b for b in bits if (int(b[:2]), int(b[3:]) // 32) not in shared[t]}
+            samples.append((v["type"], bits, used[t] - {None}))
     return samples
 
 
@@ -109,7 +125,11 @@ def report(res, dbdir):
             db[ty] = xray_segbits(dbdir, ty)
         # Bits X-Ray gives to non-PIP features (e.g. *_USED) ride along with PIPs; drop them.
         feat = set().union(*(v for k, v in db[ty].items() if k.count(".") != 2)) if db[ty] else set()
-        bits = cand - feat
+        # Mux bits are shared only among pips into the same wire: bits X-Ray gives a pip into
+        # another wire belong to a pip that was routed alongside this one, not to this one.
+        dst = tag.split(".")[1]
+        other = set().union(*(v for k, v in db[ty].items() if k.count(".") == 2 and k.split(".")[1] != dst)) if db[ty] else set()
+        bits = cand - feat - other
         xb = db[ty].get(tag)
         agree = "" if xb is None else ("yes" if xb == bits else "NO")
         print(f"{ty}\t{tag}\t{n}\t{st}\t{' '.join(sorted(bits))}\t{'' if xb is None else ' '.join(sorted(xb))}\t{agree}")
@@ -141,7 +161,7 @@ def main():
     types = set((a[a.index("--types") + 1] if "--types" in a else TYPES).split(","))
     min_on = int(a[a.index("--min-on") + 1]) if "--min-on" in a else 2
     specdir, grid, dbdir = a[0], json.load(open(a[1])), a[2]
-    report(solve(load_samples(specdir, grid, types), min_on), dbdir)
+    report(solve(load_samples(specdir, grid, types, "--mask-shared" in a), min_on), dbdir)
 
 
 if __name__ == "__main__":
