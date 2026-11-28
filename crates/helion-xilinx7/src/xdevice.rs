@@ -384,13 +384,14 @@ impl<'a> XDevice<'a> {
         let tgt_xy: Vec<(i32, i32)> = targets.iter().map(|&t| self.wire_xy(t)).collect();
 
         const PIP_BASE: u32 = 15;
+        let exp_h: u32 = std::env::var("HELION_EXP_H").ok().and_then(|v| v.parse().ok()).unwrap_or(90); // EXP
         let h = |id: u32| -> u32 {
             let (x, y) = self.wire_xy(id);
             let d = tgt_xy.iter().map(|(tx, ty)| (x - tx).abs() + (y - ty).abs()).min().unwrap_or(0);
             // Negotiating adds penalties near the sinks; a steeper
             // estimate keeps that search aimed at them instead of flooding
             // everything within the penalty's reach.
-            (d as u32) * if opts.negotiate { 220 } else { 90 }
+            (d as u32) * if opts.negotiate { 220 } else { exp_h }
         };
         let mut sb = self.search.borrow_mut();
         if sb.stamp.len() != n {
@@ -462,14 +463,17 @@ impl<'a> XDevice<'a> {
                 }
             }
         }
-        // Search region: the box spanned by the sinks and the nearest wire
-        // the net already has (its source, or a branch of its tree).
+        // Search region: the box spanned by the sinks, the net's source and
+        // the nearest wire of its tree. Without the source a far load could
+        // only branch off the tree near it, so a chip-wide net chained from
+        // load to load (G38: Ibex worst path 4.6 ns longer on one placement).
         // Late PathFinder iterations search the whole device: a net whose
         // only free detour leaves the box would otherwise keep sharing.
         let bbox = if pf.as_ref().is_some_and(|(_, ps)| *ps >= 20_000) { 0 } else { opts.bbox };
         let region = (bbox > 0).then(|| {
             let (sx, sy) = self.wire_xy(near.1);
-            let (mut x0, mut x1, mut y0, mut y1) = (sx, sx, sy, sy);
+            let (qx, qy) = self.wire_xy(start);
+            let (mut x0, mut x1, mut y0, mut y1) = (sx.min(qx), sx.max(qx), sy.min(qy), sy.max(qy));
             for &(x, y) in &tgt_xy {
                 x0 = x0.min(x);
                 x1 = x1.max(x);
