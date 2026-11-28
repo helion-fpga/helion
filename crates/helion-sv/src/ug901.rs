@@ -13,9 +13,11 @@ use bumpalo::Bump;
 use helion_ir::{resolve, CellKind, Design};
 
 use crate::{
-    addr_match_expr, bit_name, care_mask, clog2_u, emit_carry4_add_buses, emit_small_lut,
-    lut6_from_i012, normalize_mul_operands, sig_depth, sig_width, simple_word_enable,
-    str_param_hash, unpacked_word_q, word_ce_mux, Aig, Expr, RExpr, Rtl, Signal, Tok,
+    addr_match_expr, bit_name, care_mask, clog2_u, emit_carry4_add_buses,
+    emit_carry4_sub_buses, emit_small_lut, extract_arith_operand_nets,
+    lut6_from_i012, normalize_mul_operands, rexpr_post_order, sig_depth, sig_width,
+    simple_word_enable, str_param_hash, unpacked_word_q, word_ce_mux, Aig, Expr, RExpr,
+    Rtl, Signal, Tok,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1388,92 +1390,457 @@ fn extract_add_sub_operands<'a>(e: &RExpr<'a>) -> Option<(&'a str, &'a str, Opti
 /// bits, so DSP iff max(wa, wb) >= 10 and both operands below 10 go to LUTs.
 const VIVADO_DSP_MIN_BITS: usize = 10;
 
-/// G126: match an exact small multiply (bare `a * b`) or an exact single
-/// multiply-accumulate (`a * b + c` / `c + a * b`) whose operands are plain
-/// idents, and return (a, wa, b, wb, c_opt) when the multiply is below the
-/// Vivado DSP threshold and the output fits the product (and `c`) width.
-/// Returns None for anything else: ranged/bit/constant operands, mux-wrapped
-/// multiplies, subtractions, sums of products, and multiplies at or above
-/// the threshold. No mux peeling and no operand normalization: a multiply
-/// hidden behind clear/enable logic keeps the DSP path it has today.
-/// The width checks keep the LUT lowering exact without signedness info:
-/// the low out_w bits of a product need only the low out_w bits of the
-/// operands, and the LUT path computes the same unsigned product the DSP
-/// sim model computes, so signedness is irrelevant here.
-fn small_mul_parts<'a>(
+/// Coverage: the single DSP-or-LUT decision (UG902 v2020.1 Table 15, p.170).
+/// "Multiplications which are >= 10 bits are implemented on a DSP48 macro
+/// cell. Multiplication lower than this limit are implemented using LUTs."
+/// A multiply is at least 10 bits when its wider ELABORATED operand is at
+/// least 10 bits, so DSP iff max(wa, wb) >= 10 and both operands below 10
+/// go to LUTs. Every lowering site consults this one function: the
+/// whole-RHS matcher below, the embedded-multiply splice, and the
+/// flatten-cap exemption in lib.rs (through `whole_mul_form_eligible`).
+/// The widths are elaborated widths, not source widths: a slice a[7:0] of
+/// a 16-bit signal is 8 bits, a constant is its declared width, a concat
+/// is the sum of its part widths.
+fn mul_uses_dsp(wa: usize, wb: usize) -> bool {
+    wa.max(wb) >= VIVADO_DSP_MIN_BITS
+}
+
+/// Elaborated width of a multiply operand: the width Vivado decides on.
+/// Ident is the signal width; Range is the span; Bit is 1; Const is the
+/// declared width; Concat is the sum of the part widths. None when a width
+/// cannot be determined (unknown signal, out-of-range select).
+fn mul_operand_width(e: &RExpr<'_>, wmap: &HashMap<&str, usize>) -> Option<usize> {
+    match e {
+        RExpr::Ident(s) => wmap.get(s).copied().filter(|w| *w > 0),
+        RExpr::Range(s, lo, hi) => {
+            let sw = wmap.get(s).copied()?;
+            if *hi < *lo || *hi >= sw {
+                return None;
+            }
+            Some(hi - lo + 1)
+        }
+        RExpr::Bit(s, i) => {
+            let sw = wmap.get(s).copied()?;
+            if *i >= sw {
+                return None;
+            }
+            Some(1)
+        }
+        RExpr::Const { width, .. } => Some((*width).max(1)),
+        RExpr::Concat(parts) => {
+            let mut total = 0usize;
+            for p in parts {
+                total = total.checked_add(mul_operand_width(p, wmap)?)?;
+            }
+            if total == 0 || total > 32 {
+                return None;
+            }
+            Some(total)
+        }
+        _ => None,
+    }
+}
+
+/// True when every signal leaf of a multiply operand is a flat (depth 0)
+/// signal, so `mul_operand_bits` cannot fail after the matcher accepted
+/// the form. A depth>0 leaf is an unpacked-array word, which the LUT
+/// lowering cannot wire by bit name.
+fn mul_operand_flat(e: &RExpr<'_>, rtl: &Rtl) -> bool {
+    match e {
+        RExpr::Ident(s) | RExpr::Range(s, _, _) | RExpr::Bit(s, _) => {
+            sig_depth(rtl, s) == 0
+        }
+        RExpr::Const { .. } => true,
+        RExpr::Concat(parts) => parts.iter().all(|p| mul_operand_flat(p, rtl)),
+        _ => false,
+    }
+}
+
+/// The bit nets of a multiply operand, LSB first, materializing constant
+/// operands as Lut6 const cells (one per bit). Concat parts are resolved
+/// one by one and concatenated LSB-first (parts are MSB first, so the
+/// last part holds bit 0). None when the operand cannot be resolved to
+/// bit nets; the matcher guarantees this cannot happen for an accepted
+/// form, so a None here is a hard stop, not a silent fallback.
+fn mul_operand_bits(
+    d: &mut Design,
+    rtl: &Rtl,
+    e: &RExpr<'_>,
+    wmap: &HashMap<&str, usize>,
+    prefix: &str,
+) -> Option<Vec<String>> {
+    match e {
+        RExpr::Concat(parts) => {
+            let mut bits: Vec<String> = Vec::new();
+            for (k, p) in parts.iter().enumerate().rev() {
+                let pw = mul_operand_width(p, wmap)?;
+                let part_prefix = format!("{prefix}_p{k}");
+                let part_bits = mul_operand_bits(d, rtl, p, wmap, &part_prefix)?;
+                if part_bits.len() != pw {
+                    return None;
+                }
+                bits.extend(part_bits);
+            }
+            Some(bits)
+        }
+        _ => {
+            let w = mul_operand_width(e, wmap)?;
+            extract_arith_operand_nets(d, rtl, prefix, e, w)
+        }
+    }
+}
+
+/// Signal-name bit nets, LSB first, for a whole-vector signal.
+fn sig_bits(name: &str, width: usize) -> Vec<String> {
+    let w = width.max(1);
+    (0..w).map(|i| bit_name(name, w, i)).collect()
+}
+
+/// A whole-RHS multiply form the DSP machinery can lower exactly: bare
+/// `a*b`, `a*b+c`, `a*b-c`, or `a0*b0+a1*b1`. The multiply operands are
+/// arbitrary expressions (slice, bit, constant, concat); the addend `c`
+/// of a MAC or sub must be a plain signal (or a slice starting at bit 0)
+/// so the Carry4 add/sub emitters can wire it by name. Other `c` forms
+/// fall back to the splice (the multiply itself still lowers) or the DSP
+/// path. The width checks keep the LUT lowering exact without signedness
+/// info: the low out_w bits of a product need only the low out_w bits of
+/// the operands, and the LUT path computes the same unsigned product the
+/// DSP sim model computes, so signedness is irrelevant here.
+enum WholeMulForm<'a> {
+    Bare {
+        a: &'a RExpr<'a>,
+        b: &'a RExpr<'a>,
+        wa: usize,
+        wb: usize,
+    },
+    Mac {
+        a: &'a RExpr<'a>,
+        b: &'a RExpr<'a>,
+        wa: usize,
+        wb: usize,
+        c: &'a str,
+        wc: usize,
+    },
+    Sub {
+        a: &'a RExpr<'a>,
+        b: &'a RExpr<'a>,
+        wa: usize,
+        wb: usize,
+        c: &'a str,
+        wc: usize,
+    },
+    SumProd {
+        a0: &'a RExpr<'a>,
+        b0: &'a RExpr<'a>,
+        wa0: usize,
+        wb0: usize,
+        a1: &'a RExpr<'a>,
+        b1: &'a RExpr<'a>,
+        wa1: usize,
+        wb1: usize,
+    },
+}
+
+impl<'a> WholeMulForm<'a> {
+    /// True when any product in the form belongs on a DSP.
+    fn uses_dsp(&self) -> bool {
+        match *self {
+            WholeMulForm::Bare { wa, wb, .. } => mul_uses_dsp(wa, wb),
+            WholeMulForm::Mac { wa, wb, .. } | WholeMulForm::Sub { wa, wb, .. } => {
+                mul_uses_dsp(wa, wb)
+            }
+            WholeMulForm::SumProd {
+                wa0, wb0, wa1, wb1, ..
+            } => mul_uses_dsp(wa0, wb0) || mul_uses_dsp(wa1, wb1),
+        }
+    }
+}
+
+/// Match a whole-RHS multiply form. No size decision here: the caller
+/// applies `mul_uses_dsp` (step 1 absorbs only when it is false for every
+/// product; the flatten-cap exemption accepts any size, since a wide form
+/// still lowers exactly through the DSP steps). Returns None for anything
+/// else: mux-wrapped multiplies (handled by the splice), a `c` the
+/// add/sub emitters cannot wire by name, an output wider than the product
+/// (or `c`), and operands wider than the 16-bit array-multiplier limit.
+fn match_whole_mul_form<'a>(
     rhs: &'a RExpr<'a>,
+    rtl: &Rtl<'a>,
     wmap: &HashMap<&'a str, usize>,
     out_w: usize,
-) -> Option<(&'a str, usize, &'a str, usize, Option<(&'a str, usize)>)> {
-    fn ident_w<'a>(
+) -> Option<WholeMulForm<'a>> {
+    fn c_signal<'a>(
         e: &'a RExpr<'a>,
         wmap: &HashMap<&'a str, usize>,
     ) -> Option<(&'a str, usize)> {
-        if let RExpr::Ident(s) = e {
-            let w = wmap.get(s).copied().unwrap_or(0);
-            if w > 0 {
-                return Some((*s, w));
+        match e {
+            RExpr::Ident(s) => {
+                let w = wmap.get(s).copied()?;
+                if w > 0 {
+                    Some((*s, w))
+                } else {
+                    None
+                }
             }
+            RExpr::Range(s, lo, hi) => {
+                if *lo != 0 {
+                    return None;
+                }
+                let sw = wmap.get(s).copied()?;
+                if *hi >= sw {
+                    return None;
+                }
+                Some((*s, hi - lo + 1))
+            }
+            _ => None,
         }
-        None
     }
-    let (a_e, b_e, c_e): (&'a RExpr<'a>, &'a RExpr<'a>, Option<&'a RExpr<'a>>) = match rhs {
-        RExpr::Mul(x, y) => (x, y, None),
+    fn mul_widths<'a>(
+        e: &'a RExpr<'a>,
+        rtl: &Rtl<'a>,
+        wmap: &HashMap<&'a str, usize>,
+    ) -> Option<(&'a RExpr<'a>, &'a RExpr<'a>, usize, usize)> {
+        if let RExpr::Mul(x, y) = e {
+            if !mul_operand_flat(x, rtl) || !mul_operand_flat(y, rtl) {
+                return None;
+            }
+            let wa = mul_operand_width(x, wmap)?;
+            let wb = mul_operand_width(y, wmap)?;
+            if wa == 0 || wb == 0 || wa > 16 || wb > 16 {
+                return None;
+            }
+            Some((x, y, wa, wb))
+        } else {
+            None
+        }
+    }
+    if out_w == 0 {
+        return None;
+    }
+    match rhs {
+        RExpr::Mul(..) => {
+            let (a, b, wa, wb) = mul_widths(rhs, rtl, wmap)?;
+            if out_w > wa + wb {
+                return None;
+            }
+            Some(WholeMulForm::Bare { a, b, wa, wb })
+        }
         RExpr::Add(l, r) => {
-            if let RExpr::Mul(x, y) = *l {
-                (x, y, Some(*r))
-            } else if let RExpr::Mul(x, y) = *r {
-                (x, y, Some(*l))
+            if let (Some((a0, b0, wa0, wb0)), Some((a1, b1, wa1, wb1))) = (
+                mul_widths(l, rtl, wmap),
+                mul_widths(r, rtl, wmap),
+            ) {
+                if out_w > wa0 + wb0 || out_w > wa1 + wb1 {
+                    return None;
+                }
+                return Some(WholeMulForm::SumProd {
+                    a0, b0, wa0, wb0, a1, b1, wa1, wb1,
+                });
+            }
+            let (m, c_e) = if matches!(*l, RExpr::Mul(..)) {
+                (l, r)
+            } else if matches!(*r, RExpr::Mul(..)) {
+                (r, l)
             } else {
                 return None;
-            }
-        }
-        _ => return None,
-    };
-    let (an, wa) = ident_w(a_e, wmap)?;
-    let (bn, wb) = ident_w(b_e, wmap)?;
-    if wa.max(wb) >= VIVADO_DSP_MIN_BITS {
-        return None;
-    }
-    if out_w == 0 || out_w > wa + wb {
-        return None;
-    }
-    let c_part = match c_e {
-        None => None,
-        Some(c) => {
-            let (cn, wc) = ident_w(c, wmap)?;
-            if out_w > wc {
+            };
+            let (a, b, wa, wb) = mul_widths(m, rtl, wmap)?;
+            let (c, wc) = c_signal(c_e, wmap)?;
+            if out_w > wa + wb || out_w > wc {
                 return None;
             }
-            Some((cn, wc))
+            Some(WholeMulForm::Mac { a, b, wa, wb, c, wc })
         }
+        RExpr::Sub(l, r) => {
+            let (a, b, wa, wb) = mul_widths(l, rtl, wmap)?;
+            let (c, wc) = c_signal(r, wmap)?;
+            if out_w > wa + wb || out_w > wc {
+                return None;
+            }
+            Some(WholeMulForm::Sub { a, b, wa, wb, c, wc })
+        }
+        _ => None,
+    }
+}
+
+/// Emit a matched whole-RHS form as LUTs. `tag` is a unique prefix for
+/// constant-operand cells (one prefix per lowered form). The matcher
+/// guarantees every operand resolves to bit nets, so the false arms are
+/// unreachable defense in depth; a false return leaves the assignment on
+/// the DSP path.
+fn emit_whole_mul_form(
+    d: &mut Design,
+    rtl: &Rtl,
+    form: &WholeMulForm,
+    wmap: &HashMap<&str, usize>,
+    lhs: &str,
+    out_w: usize,
+    clk_opt: Option<&str>,
+    tag: &str,
+) -> bool {
+    match form {
+        WholeMulForm::Bare { a, b, .. } => {
+            let Some(a_bits) = mul_operand_bits(d, rtl, a, wmap, &format!("{tag}_0"))
+            else {
+                return false;
+            };
+            let Some(b_bits) = mul_operand_bits(d, rtl, b, wmap, &format!("{tag}_1"))
+            else {
+                return false;
+            };
+            emit_carry4_array_multiplier(d, &a_bits, &b_bits, lhs, out_w, clk_opt);
+            true
+        }
+        WholeMulForm::Mac { a, b, c, wc, .. } => {
+            let Some(a_bits) = mul_operand_bits(d, rtl, a, wmap, &format!("{tag}_0"))
+            else {
+                return false;
+            };
+            let Some(b_bits) = mul_operand_bits(d, rtl, b, wmap, &format!("{tag}_1"))
+            else {
+                return false;
+            };
+            emit_small_mul_lut(d, &a_bits, &b_bits, Some((c, *wc)), lhs, out_w, clk_opt)
+        }
+        WholeMulForm::Sub { a, b, c, wc, .. } => {
+            let Some(a_bits) = mul_operand_bits(d, rtl, a, wmap, &format!("{tag}_0"))
+            else {
+                return false;
+            };
+            let Some(b_bits) = mul_operand_bits(d, rtl, b, wmap, &format!("{tag}_1"))
+            else {
+                return false;
+            };
+            emit_small_sub_lut(d, &a_bits, &b_bits, c, *wc, lhs, out_w, clk_opt)
+        }
+        WholeMulForm::SumProd {
+            a0, b0, a1, b1, ..
+        } => {
+            let Some(a0_bits) = mul_operand_bits(d, rtl, a0, wmap, &format!("{tag}_00"))
+            else {
+                return false;
+            };
+            let Some(b0_bits) = mul_operand_bits(d, rtl, b0, wmap, &format!("{tag}_01"))
+            else {
+                return false;
+            };
+            let Some(a1_bits) = mul_operand_bits(d, rtl, a1, wmap, &format!("{tag}_10"))
+            else {
+                return false;
+            };
+            let Some(b1_bits) = mul_operand_bits(d, rtl, b1, wmap, &format!("{tag}_11"))
+            else {
+                return false;
+            };
+            // Second product into temp nets, then the first product as a
+            // MAC over the temp, using the same Carry4 machinery. A
+            // clocked sum registers the sum once, like the DSP PREG.
+            let tmp = format!("u_sop_{lhs}");
+            emit_carry4_array_multiplier(d, &a1_bits, &b1_bits, &tmp, out_w, None);
+            emit_small_mul_lut(
+                d,
+                &a0_bits,
+                &b0_bits,
+                Some((&tmp, out_w)),
+                lhs,
+                out_w,
+                clk_opt,
+            )
+        }
+    }
+}
+
+/// Signal-width map for a module, shared by the DSP pass, the splice,
+/// and the flatten-cap exemption.
+pub(crate) fn mul_wmap<'a>(rtl: &Rtl<'a>) -> HashMap<&'a str, usize> {
+    let mut wmap: HashMap<&'a str, usize> = HashMap::new();
+    for s in &rtl.signals {
+        wmap.insert(s.name, s.width.max(1));
+    }
+    for (pn, _, pw) in &rtl.ports {
+        wmap.entry(*pn).or_insert((*pw).max(1));
+    }
+    wmap
+}
+
+/// True when a combinational assign RHS is a whole-RHS multiply form the
+/// DSP machinery lowers exactly, so `flatten_leftover_signal` must not
+/// cap the module on it. Any size qualifies: a wide form still lowers
+/// exactly through the DSP steps. Explicit `use_dsp = "no"` / `"logic"`
+/// does not qualify, because that path only lowers a bare multiply.
+pub(crate) fn whole_mul_form_eligible(
+    rhs: &RExpr<'_>,
+    rtl: &Rtl<'_>,
+    wmap: &HashMap<&str, usize>,
+    ug: &Ug901ModuleAttrs,
+    lhs: &str,
+    out_w: usize,
+) -> bool {
+    if matches!(
+        ug.effective_for(lhs).use_dsp,
+        Some(UseDspMode::No | UseDspMode::Logic)
+    ) {
+        return false;
+    }
+    match_whole_mul_form(rhs, rtl, wmap, out_w).is_some()
+}
+
+/// Try to lower one NBA/assign RHS as a small whole-RHS multiply form in
+/// a capped module, where the DSP pass never runs. Returns true when the
+/// form was lowered to LUTs; false (wide form, explicit `use_dsp`, or no
+/// match) means the caller keeps its existing cap-path behaviour. `tag`
+/// is a unique prefix for constant-operand cells.
+pub(crate) fn lower_small_whole_mul(
+    d: &mut Design,
+    rtl: &Rtl<'_>,
+    wmap: &HashMap<&str, usize>,
+    lhs: &str,
+    rhs: &RExpr<'_>,
+    ug: &Ug901ModuleAttrs,
+    clk_opt: Option<&str>,
+    tag: &str,
+) -> bool {
+    if !ug.effective_for(lhs).use_dsp.is_none() {
+        return false;
+    }
+    let Some(&out_w) = wmap.get(lhs) else {
+        return false;
     };
-    Some((an, wa, bn, wb, c_part))
+    let Some(form) = match_whole_mul_form(rhs, rtl, wmap, out_w) else {
+        return false;
+    };
+    if form.uses_dsp() {
+        return false;
+    }
+    emit_whole_mul_form(d, rtl, &form, wmap, lhs, out_w, clk_opt, tag)
 }
 
 /// G126: Carry4-based array multiplier for small unsigned products, the low
-/// `out_w` bits of `a * b` (requires `out_w <= wa + wb`). Row 0 is one AND
-/// LUT per partial-product bit; each later row adds its partial-product row
-/// into the running sum with one S LUT per bit (the AND folded into the
-/// carry-chain S input, `S = sum ^ (a & b)`) and Carry4 cells for the carry.
-/// Cost is one LUT per partial-product bit: an 8x8 multiply is 64 LUTs plus
-/// 14 Carry4 cells, matching Vivado's 61-71 LUTs for an 8x8 LUT multiplier,
-/// where the LUT6-only array multiplier needs 128 LUTs. When `clk_opt` is
-/// set, the product bits are registered into HFFs driving `lhs` (NBA case);
+/// `out_w` bits of `a * b` (requires `out_w <= wa + wb`). The operands are
+/// bit nets, LSB first, so slices, constants, and concats lower without a
+/// temp signal: row 0 is one AND LUT per partial-product bit; each later
+/// row adds its partial-product row into the running sum with one S LUT
+/// per bit (the AND folded into the carry-chain S input,
+/// `S = sum ^ (a & b)`) and Carry4 cells for the carry. Cost is one LUT
+/// per partial-product bit: an 8x8 multiply is 64 LUTs plus 14 Carry4
+/// cells, matching Vivado's 61-71 LUTs for an 8x8 LUT multiplier, where
+/// the LUT6-only array multiplier needs 128 LUTs. When `clk_opt` is set,
+/// the product bits are registered into HFFs driving `lhs` (NBA case);
 /// otherwise the product bits drive `lhs` directly (assign case).
 fn emit_carry4_array_multiplier(
     d: &mut Design,
-    a_sig: &str,
-    wa: usize,
-    b_sig: &str,
-    wb: usize,
+    a_bits: &[String],
+    b_bits: &[String],
     lhs: &str,
     out_w: usize,
     clk_opt: Option<&str>,
 ) {
     const AND2_INIT: u64 = 0x8888_8888_8888_8888;
-    let wa = wa.max(1).min(16);
-    let wb = wb.max(1).min(16);
+    let wa = a_bits.len().max(1).min(16);
+    let wb = b_bits.len().max(1).min(16);
+    if a_bits.is_empty() || b_bits.is_empty() {
+        return;
+    }
     let out_w = out_w.max(1).min(32);
     let s_init = lut6_from_i012(|s, a, b| s ^ (a & b));
     let last_row = wb.min(out_w).saturating_sub(1);
@@ -1488,9 +1855,9 @@ fn emit_carry4_array_multiplier(
         }
         let is_last = j == last_row;
         if j == 0 {
-            let b0 = bit_name(b_sig, wb, 0);
+            let b0 = b_bits[0].clone();
             for i in 0..nbits {
-                let ai = bit_name(a_sig, wa, i);
+                let ai = a_bits[i].clone();
                 let snet = if clk_opt.is_none() && (i == 0 || is_last) {
                     bit_name(lhs, out_w, i)
                 } else {
@@ -1510,11 +1877,11 @@ fn emit_carry4_array_multiplier(
             continue;
         }
         // Rows 1..wb: add the partial-product row into the running sum.
-        let bj = bit_name(b_sig, wb, j);
+        let bj = b_bits[j].clone();
         // S LUTs: S[t] = row_sums[t+1] ^ (a[t] & b[j]).
         let mut s_nets: Vec<String> = Vec::with_capacity(nbits);
         for t in 0..nbits {
-            let ai = bit_name(a_sig, wa, t);
+            let ai = a_bits[t].clone();
             let snet = format!("n_cmul_{lhs}_s{j}_{t}");
             let scell = format!("u_cmul_sum_{lhs}_{j}_{t}");
             d.add_cell(&scell, CellKind::Lut6 { init: s_init });
@@ -1617,10 +1984,8 @@ fn emit_carry4_array_multiplier(
 /// in which case the caller must leave the assignment on the DSP path.
 fn emit_small_mul_lut(
     d: &mut Design,
-    a: &str,
-    wa: usize,
-    b: &str,
-    wb: usize,
+    a_bits: &[String],
+    b_bits: &[String],
     c_opt: Option<(&str, usize)>,
     lhs: &str,
     out_w: usize,
@@ -1628,12 +1993,12 @@ fn emit_small_mul_lut(
 ) -> bool {
     match c_opt {
         None => {
-            emit_carry4_array_multiplier(d, a, wa, b, wb, lhs, out_w, clk_opt);
+            emit_carry4_array_multiplier(d, a_bits, b_bits, lhs, out_w, clk_opt);
             true
         }
         Some((c, wc)) => {
             let tmp_prod = format!("u_macl_{lhs}");
-            emit_carry4_array_multiplier(d, a, wa, b, wb, &tmp_prod, out_w, None);
+            emit_carry4_array_multiplier(d, a_bits, b_bits, &tmp_prod, out_w, None);
             match clk_opt {
                 None => emit_carry4_add_buses(d, lhs, out_w, &tmp_prod, out_w, c, wc),
                 Some(clk) => {
@@ -1655,6 +2020,164 @@ fn emit_small_mul_lut(
     }
 }
 
+/// Coverage: emit a small multiply-subtract (`a * b - c`) as LUTs, the
+/// mirror of `emit_small_mul_lut`: the product into temp nets, then a
+/// Carry4 subtract of `c` (S = XNOR, CYINIT = 1). A clocked (NBA) sub
+/// registers the difference once, like the DSP PREG it replaces.
+/// Returns false if the subtract could not be emitted, in which case the
+/// caller must leave the assignment on the DSP path.
+fn emit_small_sub_lut(
+    d: &mut Design,
+    a_bits: &[String],
+    b_bits: &[String],
+    c: &str,
+    wc: usize,
+    lhs: &str,
+    out_w: usize,
+    clk_opt: Option<&str>,
+) -> bool {
+    let tmp_prod = format!("u_macl_{lhs}");
+    emit_carry4_array_multiplier(d, a_bits, b_bits, &tmp_prod, out_w, None);
+    match clk_opt {
+        None => emit_carry4_sub_buses(d, lhs, out_w, &tmp_prod, out_w, c, wc),
+        Some(clk) => {
+            let tmp_diff = format!("u_macs_{lhs}");
+            if !emit_carry4_sub_buses(d, &tmp_diff, out_w, &tmp_prod, out_w, c, wc) {
+                return false;
+            }
+            for k in 0..out_w {
+                let ff = format!("u_macl_ff_{lhs}_{k}");
+                d.add_cell(&ff, CellKind::Hff);
+                d.connect(clk, &ff, "CLK");
+                d.connect(&bit_name(&tmp_diff, out_w, k), &ff, "D");
+                d.connect(&bit_name(lhs, out_w, k), &ff, "Q");
+            }
+            true
+        }
+    }
+}
+
+/// Try to lower one multiply node to a shared temp product. Returns the
+/// temp signal name on success, None when the multiply stays for the DSP
+/// steps (wide operands, unresolvable widths, non-flat operands, or a
+/// bit-resolution failure, which the checks above make unreachable).
+fn try_splice_mul<'a>(
+    a: &RExpr<'a>,
+    b: &RExpr<'a>,
+    d: &mut Design,
+    rtl: &mut Rtl<'a>,
+    wmap: &mut HashMap<&'a str, usize>,
+    arena: &'a Bump,
+    cache: &mut HashMap<String, (&'a str, usize)>,
+    counter: &mut usize,
+) -> Option<&'a str> {
+    if !mul_operand_flat(a, rtl) || !mul_operand_flat(b, rtl) {
+        return None;
+    }
+    let wa = mul_operand_width(a, wmap)?;
+    let wb = mul_operand_width(b, wmap)?;
+    if wa == 0 || wb == 0 || wa > 16 || wb > 16 {
+        return None;
+    }
+    if mul_uses_dsp(wa, wb) {
+        return None;
+    }
+    let key = format!("{a:?}|{b:?}");
+    if let Some(&(temp, _)) = cache.get(&key) {
+        return Some(temp);
+    }
+    let n = *counter + 1;
+    let a_bits = mul_operand_bits(d, rtl, a, wmap, &format!("mul_u{n}_a"))?;
+    let b_bits = mul_operand_bits(d, rtl, b, wmap, &format!("mul_u{n}_b"))?;
+    *counter = n;
+    let temp: &'a str = arena.alloc_str(&format!("u_mul_{n}"));
+    let prod_w = wa + wb;
+    emit_carry4_array_multiplier(d, &a_bits, &b_bits, temp, prod_w, None);
+    rtl.signals.push(Signal {
+        name: temp,
+        width: prod_w,
+        depth: 0,
+        keep: false,
+        mark_debug: false,
+        force_bram: false,
+    });
+    wmap.insert(temp, prod_w);
+    cache.insert(key, (temp, prod_w));
+    Some(temp)
+}
+
+/// Coverage: rebuild an RHS with every small multiply replaced by an
+/// Ident of a shared temp product. The temp is emitted once per unique
+/// multiply (keyed by the rebuilt operands) and registered as a signal
+/// of the full product width, so later steps and the bit-blast see it as
+/// an ordinary bus. Wide multiplies stay in place for the DSP steps.
+/// IndexPart and WordAt subtrees are opaque (address math is not a DSP
+/// multiply); Call args are left as written (calls are inlined by now).
+/// Iterative post-order rebuild, like `normalize_mul_operands`.
+fn splice_small_muls<'a, 'e>(
+    e: &'e RExpr<'a>,
+    d: &mut Design,
+    rtl: &mut Rtl<'a>,
+    wmap: &mut HashMap<&'a str, usize>,
+    arena: &'a Bump,
+    cache: &mut HashMap<String, (&'a str, usize)>,
+    counter: &mut usize,
+) -> RExpr<'a>
+where
+    'a: 'e,
+{
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len() + 1);
+    let kid = |memo: &HashMap<*const RExpr<'a>, &'a RExpr<'a>>, p: *const RExpr<'a>| -> &'a RExpr<'a> {
+        memo[&p]
+    };
+    for n in post {
+        let rebuilt: RExpr<'a> = match n {
+            RExpr::Mul(a, b) => {
+                let ra = (*kid(&memo, *a as *const RExpr<'a>)).clone();
+                let rb = (*kid(&memo, *b as *const RExpr<'a>)).clone();
+                match try_splice_mul(&ra, &rb, d, rtl, wmap, arena, cache, counter) {
+                    Some(temp) => RExpr::Ident(temp),
+                    None => RExpr::Mul(arena.alloc(ra), arena.alloc(rb)),
+                }
+            }
+            RExpr::Not(x) => RExpr::Not(kid(&memo, *x as *const _)),
+            RExpr::And(a, b) => RExpr::And(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Or(a, b) => RExpr::Or(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Xor(a, b) => RExpr::Xor(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Mux(c, t, f) => RExpr::Mux(
+                kid(&memo, *c as *const _),
+                kid(&memo, *t as *const _),
+                kid(&memo, *f as *const _),
+            ),
+            RExpr::Eq(a, b) => RExpr::Eq(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Ne(a, b) => RExpr::Ne(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Lt(a, b) => RExpr::Lt(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Add(a, b) => RExpr::Add(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Sub(a, b) => RExpr::Sub(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Shr(a, b) => RExpr::Shr(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Ashr(a, b) => {
+                RExpr::Ashr(kid(&memo, *a as *const _), kid(&memo, *b as *const _))
+            }
+            RExpr::Shl(a, b) => RExpr::Shl(kid(&memo, *a as *const _), kid(&memo, *b as *const _)),
+            RExpr::Concat(parts) => RExpr::Concat(
+                parts
+                    .iter()
+                    .map(|p| (*kid(&memo, p as *const RExpr<'a>)).clone())
+                    .collect(),
+            ),
+            RExpr::RedXor(x) => RExpr::RedXor(kid(&memo, *x as *const _)),
+            RExpr::RedAnd(x) => RExpr::RedAnd(kid(&memo, *x as *const _)),
+            RExpr::RedOr(x) => RExpr::RedOr(kid(&memo, *x as *const _)),
+            RExpr::IndexPart { .. } | RExpr::WordAt { .. } | RExpr::Call { .. } => (*n).clone(),
+            other => (*other).clone(),
+        };
+        memo.insert(n as *const RExpr<'a>, arena.alloc(rebuilt));
+    }
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
+}
+
 pub(crate) fn apply_ug901_dsp_pass<'a>(
     rtl: &mut Rtl<'a>,
     d: &mut Design,
@@ -1665,13 +2188,8 @@ pub(crate) fn apply_ug901_dsp_pass<'a>(
 ) {
     // 1. Handle `use_dsp = "no"` and `use_dsp = "logic"`: emit a LUT6 array multiplier
     //    directly into `d` so `Dsp48e1` is inhibited without tripping `wide_cone`.
-    let mut wmap: HashMap<&'a str, usize> = HashMap::new();
-    for s in &rtl.signals {
-        wmap.insert(s.name, s.width.max(1));
-    }
-    for (pn, _, pw) in &rtl.ports {
-        wmap.entry(*pn).or_insert((*pw).max(1));
-    }
+    let mut wmap = mul_wmap(rtl);
+    let mut mul_tag = 0usize;
     let mut no_dsp_nbas: HashSet<&'a str> = HashSet::new();
     for (lhs, bit, rhs) in &rtl.nbas {
         if !matches!(bit, None | Some(0)) {
@@ -1695,15 +2213,19 @@ pub(crate) fn apply_ug901_dsp_pass<'a>(
                 no_dsp_nbas.insert(*lhs);
             }
         }
-        // G126: small multiplies with no explicit `use_dsp` go to LUTs
-        // (Vivado DSP threshold), not to a DSP block. Only exact
-        // whole-vector bare multiplies and single multiply-accumulates
-        // with plain ident operands; anything else keeps the DSP path.
+        // Coverage (G126 generalized): small whole-RHS multiply forms with
+        // no explicit `use_dsp` go to LUTs (Vivado DSP threshold), not to
+        // a DSP block. The single decision is `mul_uses_dsp`, consulted
+        // here through `WholeMulForm::uses_dsp`.
         if mode.is_none() && bit.is_none() {
             if let Some(&out_w) = wmap.get(lhs) {
-                if let Some((a, wa, b, wb, c_opt)) = small_mul_parts(rhs, &wmap, out_w) {
-                    if emit_small_mul_lut(d, a, wa, b, wb, c_opt, lhs, out_w, Some(clk)) {
-                        no_dsp_nbas.insert(*lhs);
+                if let Some(form) = match_whole_mul_form(rhs, rtl, &wmap, out_w) {
+                    if !form.uses_dsp() {
+                        mul_tag += 1;
+                        let tag = format!("m{mul_tag}");
+                        if emit_whole_mul_form(d, rtl, &form, &wmap, lhs, out_w, Some(clk), &tag) {
+                            no_dsp_nbas.insert(*lhs);
+                        }
                     }
                 }
             }
@@ -1734,15 +2256,17 @@ pub(crate) fn apply_ug901_dsp_pass<'a>(
                 no_dsp_assigns.insert(*lhs);
             }
         }
-        // G126: small multiplies with no explicit `use_dsp` go to LUTs
-        // (Vivado DSP threshold), not to a DSP block. Only exact
-        // whole-vector bare multiplies and single multiply-accumulates
-        // with plain ident operands; anything else keeps the DSP path.
+        // Coverage (G126 generalized): small whole-RHS multiply forms with
+        // no explicit `use_dsp` go to LUTs (Vivado DSP threshold).
         if mode.is_none() {
             if let Some(&out_w) = wmap.get(lhs) {
-                if let Some((a, wa, b, wb, c_opt)) = small_mul_parts(rhs, &wmap, out_w) {
-                    if emit_small_mul_lut(d, a, wa, b, wb, c_opt, lhs, out_w, None) {
-                        no_dsp_assigns.insert(*lhs);
+                if let Some(form) = match_whole_mul_form(rhs, rtl, &wmap, out_w) {
+                    if !form.uses_dsp() {
+                        mul_tag += 1;
+                        let tag = format!("m{mul_tag}");
+                        if emit_whole_mul_form(d, rtl, &form, &wmap, lhs, out_w, None, &tag) {
+                            no_dsp_assigns.insert(*lhs);
+                        }
                     }
                 }
             }
@@ -1751,6 +2275,66 @@ pub(crate) fn apply_ug901_dsp_pass<'a>(
     if !no_dsp_assigns.is_empty() {
         rtl.assigns
             .retain(|(lhs, _, _)| !no_dsp_assigns.contains(lhs));
+    }
+
+    // 1c. Coverage: splice small multiplies embedded in a larger RHS (a
+    // mux arm, a wider Add tree, a per-bit NBA from if/else flattening)
+    // to a shared temp product, leaving the rest of the expression to
+    // lower normally. Runs after whole-RHS absorption so an exact form
+    // keeps its Carry4 add/sub fast path, and before steps 2-5 so they
+    // see the rewritten RHSs. Each unique multiply is emitted once per
+    // module and shared: the enable-wrapped MAC flattens to one NBA per
+    // bit of `c`, all containing the same Mul, and one temp product
+    // serves all of them.
+    {
+        let mut splice_cache: HashMap<String, (&'a str, usize)> = HashMap::new();
+        let mut splice_counter = 0usize;
+        for idx in 0..rtl.nbas.len() {
+            if !ug.effective_for(rtl.nbas[idx].0).use_dsp.is_none() {
+                continue;
+            }
+            let rhs = std::mem::replace(
+                &mut rtl.nbas[idx].2,
+                RExpr::Const {
+                    val: 0,
+                    width: 1,
+                    care: u128::MAX,
+                },
+            );
+            let new_rhs = splice_small_muls(
+                &rhs,
+                d,
+                rtl,
+                &mut wmap,
+                arena,
+                &mut splice_cache,
+                &mut splice_counter,
+            );
+            rtl.nbas[idx].2 = new_rhs;
+        }
+        for idx in 0..rtl.assigns.len() {
+            if !ug.effective_for(rtl.assigns[idx].0).use_dsp.is_none() {
+                continue;
+            }
+            let rhs = std::mem::replace(
+                &mut rtl.assigns[idx].2,
+                RExpr::Const {
+                    val: 0,
+                    width: 1,
+                    care: u128::MAX,
+                },
+            );
+            let new_rhs = splice_small_muls(
+                &rhs,
+                d,
+                rtl,
+                &mut wmap,
+                arena,
+                &mut splice_cache,
+                &mut splice_counter,
+            );
+            rtl.assigns[idx].2 = new_rhs;
+        }
     }
 
     // 2. Detect simple input pipeline registers (`a_reg <= a_in`) for AREG/BREG absorption.

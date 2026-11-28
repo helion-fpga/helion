@@ -15,3 +15,7 @@ helion-place = { workspace = true }
 helion-route = { workspace = true }
 helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
+# Coverage lane (G125 port): value-level guard for the LUT sum-of-products
+# lowering (helion-sim models Carry4 CO pins, so the temp+MAC composition
+# simulates exactly). Mirrors the G126 helion-sim dev-dep in helion-sv.
+helion-sim = { workspace = true }

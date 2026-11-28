@@ -3083,12 +3083,13 @@ fn rexpr_is_wire_mux_form(e: &RExpr<'_>) -> bool {
 /// Name the signal whose post-flatten cone stalls, or None.
 /// 15011: nbas=0, assigns>=32, combo case expanded to per-bit mux assigns.
 /// 14777: nbas>=128 and a wide unpacked word (width>16) that var-index lower refuses.
-fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
+fn flatten_leftover_signal(rtl: &Rtl, ug: &ug901::Ug901ModuleAttrs) -> Option<String> {
     // Transient rewrite arenas die with this call.
     let arena = Bump::new();
     // Leaf ALU-style leftover: nested add/sub under mux/concat. One
     // flatten_cap, no bit-blast, synth_design within the QA 3s window.
     if rtl.nbas.is_empty() {
+        let wmap = ug901::mul_wmap(rtl);
         for (lhs, _bit, rhs) in &rtl.assigns {
             if rexpr_has_nested_arith(rhs) {
                 // bus + {zeros, wire bits} lowers via ripple_add_zpad — not a
@@ -3103,6 +3104,16 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
                     || packed_add_multi_buses(rhs, rtl).is_some()
                 {
                     continue;
+                }
+                // Coverage: a whole-RHS multiply form (bare, MAC, sub,
+                // sum of products, any size, generalized operands) lowers
+                // exactly in the DSP pass, so it is not a leftover cone.
+                // Without this the cap drops every combinational MAC/sub/
+                // sumprod before the DSP pass runs.
+                if let Some(&out_w) = wmap.get(lhs) {
+                    if ug901::whole_mul_form_eligible(rhs, rtl, &wmap, ug, lhs, out_w) {
+                        continue;
+                    }
                 }
                 return Some(lhs.to_string());
             }
@@ -21075,6 +21086,105 @@ fn emit_carry4_add_buses(
     true
 }
 
+/// Carry4 subtraction of two buses: `diff = a - b` (low `width` bits).
+/// Same shape as `emit_carry4_add_buses`, but the propagate term is
+/// S = A XNOR B with DI = A and the head chunk's CYINIT tied to the
+/// constant-1 net, which computes A + ~B + 1. The final carry is the
+/// (op_w)th diff bit, exactly as in the add case. Returns false when the
+/// width is out of the ripple range, in which case the caller must leave
+/// the assignment on the DSP path.
+fn emit_carry4_sub_buses(
+    d: &mut Design,
+    diff: &str,
+    width: usize,
+    a: &str,
+    aw: usize,
+    b: &str,
+    bw: usize,
+) -> bool {
+    let op_w = aw.max(bw).min(width);
+    if op_w == 0 || op_w > RIPPLE_ADD_MAX {
+        return false;
+    }
+    let mut carry_in: Option<String> = None;
+    let n_chunks = (op_w + 3) / 4;
+    for chunk in 0..n_chunks {
+        let base = chunk * 4;
+        let cell = format!("u_carry4sub_{diff}_{chunk}");
+        d.add_cell(&cell, CellKind::Carry4);
+        if chunk == 0 {
+            // A - B = A + ~B + 1: the head chunk carries in 1. The net
+            // literally named "1" is the sim's constant-1 net and the
+            // xilinx7 emitter maps a CYINIT=1 head to PRECYINIT.C1.
+            d.connect("1", &cell, "CYINIT");
+        } else if let Some(ci_net) = carry_in.take() {
+            d.connect(&ci_net, &cell, "CI");
+        }
+        for i in 0..4 {
+            let bit = base + i;
+            if bit >= op_w {
+                break;
+            }
+            let an = if bit < aw {
+                Some(bit_name(a, aw, bit))
+            } else {
+                None
+            };
+            let bn = if bit < bw {
+                Some(bit_name(b, bw, bit))
+            } else {
+                None
+            };
+            if let Some(an_net) = an {
+                d.connect(&an_net, &cell, &format!("DI{i}"));
+                let s_net = format!("n_carry4sub_{diff}_{chunk}_s{i}");
+                if let Some(bn_net) = bn {
+                    let xnor_cell = format!("u_carry4sub_{diff}_{chunk}_xnor{i}");
+                    emit_lut_pins(
+                        d,
+                        &xnor_cell,
+                        &s_net,
+                        lut6_xnor2(),
+                        &[(an_net.as_str(), "I0"), (bn_net.as_str(), "I1")],
+                    );
+                } else {
+                    // a bit past b's width subtracts 0: S = a XNOR 0 = ~a.
+                    // The LUT is an inverter on a (XNOR with a grounded I1
+                    // reads the same as NOT I0).
+                    let inv_cell = format!("u_carry4sub_{diff}_{chunk}_inv{i}");
+                    emit_lut_pins(
+                        d,
+                        &inv_cell,
+                        &s_net,
+                        lut6_inv(),
+                        &[(an_net.as_str(), "I0")],
+                    );
+                }
+                d.connect(&s_net, &cell, &format!("S{i}"));
+            }
+            let diff_net = bit_name(diff, width, bit);
+            d.connect(&diff_net, &cell, &format!("O{i}"));
+        }
+        let co_net = format!("n_carry4sub_{diff}_{chunk}_co3");
+        d.connect(&co_net, &cell, "CO3");
+        carry_in = Some(co_net);
+    }
+    if width == op_w + 1 {
+        if let Some(cout) = carry_in {
+            let diff_net = bit_name(diff, width, op_w);
+            let buf_cell = format!("u_carry4sub_{diff}_cout_buf");
+            emit_lut_pins(
+                d,
+                &buf_cell,
+                &diff_net,
+                lut6_buf(),
+                &[(cout.as_str(), "I0")],
+            );
+        }
+    }
+    true
+}
+
 fn emit_ripple_add_multi(
     d: &mut Design,
     rtl: &Rtl,
@@ -22752,7 +22862,7 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         return Ok(d);
     }
 
-    if let Some(sig) = flatten_leftover_signal(&rtl_owned) {
+    if let Some(sig) = flatten_leftover_signal(&rtl_owned, &ug_attrs) {
         note_flatten_cap(&rtl_owned.module, &sig);
         d.attrs.set("FLATTEN_CAP", "1");
         // A capped module still gets its multipliers.
@@ -22765,14 +22875,55 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
         // G3/D1. Emitting here is the same call, same order, as the loop below
         // makes for every other module; only the leftover cone stays unblasted.
         let mut n_mac = 0usize;
-        for (lhs, _bit, rhs) in &rtl_owned.nbas {
+        // Coverage: a capped module still gets its small whole-RHS
+        // multiplies as LUTs (the same lowering step 1 applies), instead
+        // of a DSP per NBA or a dropped assign. Wide forms keep the
+        // emit_mac27 behaviour below; embedded (mux-wrapped) multiplies
+        // in a capped module are not spliced here, so they keep the DSP
+        // path, as before.
+        let cap_wmap = ug901::mul_wmap(&rtl_owned);
+        let mut cap_tag = 0usize;
+        for (lhs, bit, rhs) in &rtl_owned.nbas {
             if sig_depth(&rtl_owned, lhs) > 0 {
                 continue;
+            }
+            if bit.is_none() {
+                cap_tag += 1;
+                let tag = format!("cap{cap_tag}");
+                if ug901::lower_small_whole_mul(
+                    &mut d,
+                    &rtl_owned,
+                    &cap_wmap,
+                    lhs,
+                    rhs,
+                    &ug_attrs,
+                    Some(clk),
+                    &tag,
+                ) {
+                    continue;
+                }
             }
             if is_mac_rhs(rhs) {
                 emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs, true);
                 n_mac += 1;
             }
+        }
+        for (lhs, bit, rhs) in &rtl_owned.assigns {
+            if sig_depth(&rtl_owned, lhs) > 0 || bit.is_some() {
+                continue;
+            }
+            cap_tag += 1;
+            let tag = format!("cap{cap_tag}");
+            ug901::lower_small_whole_mul(
+                &mut d,
+                &rtl_owned,
+                &cap_wmap,
+                lhs,
+                rhs,
+                &ug_attrs,
+                None,
+                &tag,
+            );
         }
         if n_mac > 0 {
             d.attrs.set("DSP_BEFORE_FLATTEN_CAP", &n_mac.to_string());
@@ -26039,8 +26190,12 @@ endmodule
 
     #[test]
     fn comb_mul_assign_infers_mac27() {
+        // DW is 16 (not 8): an 8x8 multiply belongs on LUTs under the
+        // UG902 10-bit rule (pinned by g126_comb_mul_8x8_maps_to_luts
+        // and cov_slice_mul_8x8_maps_to_luts, which use this same
+        // ranged form), so the DSP-inference pin needs a wide multiply.
         let src = r#"
-module mul #(parameter DW = 8, parameter OW = 2 * DW) (
+module mul #(parameter DW = 16, parameter OW = 2 * DW) (
   input [DW-1:0] a, input [DW-1:0] b, output [OW-1:0] out
 );
   assign out[OW-1:0] = a[DW-1:0] * b[DW-1:0];
@@ -26243,10 +26398,12 @@ endmodule
     }
 
     #[test]
-    fn g126_mux_wrapped_mac_8x8_stays_dsp() {
-        // Residual for G128: a multiply behind clear/enable muxes keeps the
-        // DSP path; G126 does not peel the mux (the DSP path drops the
-        // mux conditions today, and the LUT path must not reproduce that).
+    fn g126_mux_wrapped_mac_8x8_maps_to_luts() {
+        // Coverage lane: a multiply behind clear/enable muxes now goes
+        // to LUTs (one shared product, muxes kept), where G126 left it
+        // on the DSP path (16 DSPs, mux conditions dropped). Same source
+        // and counts as cov_enable_wrapped_mac_8x8_maps_to_luts, which
+        // carries the LUT breakdown and the sim proof.
         let src = r#"
 module mac #(parameter DW = 8, parameter OW = 16) (
   input clk, input clear, input en,
@@ -26260,12 +26417,452 @@ module mac #(parameter DW = 8, parameter OW = 16) (
 endmodule
 "#;
         let d = synth_sv(src, "mac.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "mux-wrapped 8x8 MAC must not use a DSP, got {dsps}");
+        assert_eq!(hffs, 16, "mux-wrapped MAC registers all 16 bits, got {hffs}");
+        assert_eq!(luts, 291, "mux-wrapped 8x8 MAC is 291 LUTs, got {luts}");
+        assert_eq!(carry4s, 14, "mux-wrapped 8x8 MAC is 14 Carry4, got {carry4s}");
+    }
+
+    // Coverage (fm/qor-size-4.5): the UG902 10-bit decision must cover every
+    // multiply form, not just bare a*b / a*b+c over plain idents. Each test
+    // pins exact cell counts; the sim tests prove the lowered form computes
+    // the right value. The single decision point is `mul_uses_dsp` in
+    // ug901.rs, consulted by the whole-RHS matcher and the splice.
+    #[test]
+    fn cov_slice_mul_8x8_maps_to_luts() {
+        let src = r#"
+module mul(input [15:0] a, input [7:0] b, output [15:0] out);
+  assign out = a[7:0] * b;
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "sliced 8x8 must not use a DSP, cells={:?}", d.cells);
+        assert_eq!(hffs, 0, "combinational slice multiply has no flops");
+        assert_eq!(luts, 64, "sliced 8x8 Carry4 array multiplier is 64 LUTs, got {luts}");
+        assert_eq!(carry4s, 14, "sliced 8x8 Carry4 array multiplier is 14 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_slice_hi_mul_8x8_maps_to_luts() {
+        let src = r#"
+module mul(input [15:0] a, input [7:0] b, output [15:0] out);
+  assign out = a[15:8] * b;
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "high-slice 8x8 must not use a DSP, cells={:?}", d.cells);
+        assert_eq!(hffs, 0, "combinational slice multiply has no flops");
+        assert_eq!(luts, 64, "high-slice 8x8 is 64 LUTs, got {luts}");
+        assert_eq!(carry4s, 14, "high-slice 8x8 is 14 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_slice_mul_sim_values() {
+        for (lo, shift) in [(0usize, 0u32), (8usize, 8u32)] {
+            let src = format!(
+                r#"
+module mul(input [15:0] a, input [7:0] b, output [15:0] out);
+  assign out = a[{hi}:{lo}] * b;
+endmodule
+"#,
+                hi = lo + 7,
+                lo = lo
+            );
+            let mut d = synth_sv(&src, "mul.sv").expect("synth");
+            g126_bit_blast_ports(&mut d);
+            let mut sim = helion_sim::Sim::new(&d);
+            for (a8, b8, _) in g126_vectors() {
+                let aval: u64 = ((a8 & 0xff) as u64) << shift;
+                g126_drive(&mut sim, "a", 16, aval);
+                g126_drive(&mut sim, "b", 8, b8);
+                let got = g126_sample(&sim, "out", 16).expect("out must be driven");
+                let want = ((a8 & 0xff).wrapping_mul(b8 & 0xff)) & 0xffff;
+                assert_eq!(got, want, "slice [{hi}:{lo}]: {aval} * {b8} = {want}, sim gave {got}", hi = lo + 7, lo = lo);
+            }
+        }
+    }
+
+    #[test]
+    fn cov_const_mul_8x8_maps_to_luts() {
+        let src = r#"
+module mul(input [7:0] a, output [15:0] out);
+  assign out = a * 8'd5;
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "8-bit by constant-5 must not use a DSP, cells={:?}", d.cells);
+        assert_eq!(hffs, 0, "combinational constant multiply has no flops");
+        // 64 LUTs for the array multiplier plus one Lut6 const cell per
+        // constant bit (the constant's declared width is 8, below the
+        // 10-bit DSP threshold, so the UG902 width rule sends it to LUTs).
+        assert_eq!(luts, 72, "constant 8x8 is 72 LUTs, got {luts}");
+        assert_eq!(carry4s, 14, "constant 8x8 is 14 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_const_mul_sim_values() {
+        let src = r#"
+module mul(input [7:0] a, output [15:0] out);
+  assign out = a * 8'd5;
+endmodule
+"#;
+        let mut d = synth_sv(src, "mul.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        for (a, _, _) in g126_vectors() {
+            g126_drive(&mut sim, "a", 8, a);
+            let got = g126_sample(&sim, "out", 16).expect("out must be driven");
+            let want = (a.wrapping_mul(5)) & 0xffff;
+            assert_eq!(got, want, "const mul: {a} * 5 = {want}, sim gave {got}");
+        }
+    }
+
+    #[test]
+    fn cov_const_wide_mul_stays_dsp() {
+        // The UG902 width rule reads the constant's DECLARED width: a 16-bit
+        // constant operand is at the DSP threshold even though its value is
+        // small. This pins the rule; cluster confirmation is still open.
+        let src = r#"
+module mul(input [7:0] a, output [23:0] out);
+  assign out = a * 16'd5;
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
         let (luts, _, _, dsps) = g126_counts(&d);
-        // Pre-existing: the if/else flattens to one NBA per bit of `c`, and
-        // each per-bit NBA infers its own full DSP, so this form uses 16
-        // DSPs, not 1. The G126 point is only that it stays on DSP.
-        assert!(dsps >= 1, "mux-wrapped 8x8 MAC stays on DSP, got {dsps}");
-        assert_eq!(luts, 0, "mux-wrapped MAC must not lower to LUTs, got {luts}");
+        assert_eq!(dsps, 1, "8-bit by 16-bit constant stays on DSP");
+        assert_eq!(luts, 0, "DSP path must not bitblast a wide-constant mul, got {luts}");
+    }
+
+    #[test]
+    fn cov_concat_mul_8x8_maps_to_luts() {
+        let src = r#"
+module mul(input [7:0] a, input [7:0] b, input [7:0] c, output [15:0] out);
+  assign out = {a[3:0], b[3:0]} * c;
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "concat 8x8 must not use a DSP, cells={:?}", d.cells);
+        assert_eq!(hffs, 0, "combinational concat multiply has no flops");
+        assert_eq!(luts, 64, "concat 8x8 is 64 LUTs, got {luts}");
+        assert_eq!(carry4s, 14, "concat 8x8 is 14 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_concat_mul_sim_values() {
+        let src = r#"
+module mul(input [7:0] a, input [7:0] b, input [7:0] c, output [15:0] out);
+  assign out = {a[3:0], b[3:0]} * c;
+endmodule
+"#;
+        let mut d = synth_sv(src, "mul.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        for (a, b, c) in g126_vectors() {
+            g126_drive(&mut sim, "a", 8, a);
+            g126_drive(&mut sim, "b", 8, b);
+            g126_drive(&mut sim, "c", 8, c & 0xff);
+            let got = g126_sample(&sim, "out", 16).expect("out must be driven");
+            let concat = (((a & 0xf) << 4) | (b & 0xf)) as u64;
+            let want = (concat.wrapping_mul(c & 0xff)) & 0xffff;
+            assert_eq!(got, want, "concat mul: {concat} * {c} = {want}, sim gave {got}");
+        }
+    }
+
+    #[test]
+    fn cov_bit_mul_1x8_maps_to_luts() {
+        let src = r#"
+module mul(input [7:0] a, input [7:0] b, output [7:0] out);
+  assign out = a[3] * b;
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "single-bit by 8-bit must not use a DSP, cells={:?}", d.cells);
+        assert_eq!(hffs, 0, "combinational bit multiply has no flops");
+        // 1 AND LUT for row 0 plus 1 S LUT per later row; 1 Carry4 per row.
+        assert_eq!(luts, 8, "1x8 multiply is 8 LUTs, got {luts}");
+        assert_eq!(carry4s, 7, "1x8 multiply is 7 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_bit_mul_sim_values() {
+        let src = r#"
+module mul(input [7:0] a, input [7:0] b, output [7:0] out);
+  assign out = a[3] * b;
+endmodule
+"#;
+        let mut d = synth_sv(src, "mul.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        for (a, b, _) in g126_vectors() {
+            g126_drive(&mut sim, "a", 8, a);
+            g126_drive(&mut sim, "b", 8, b);
+            let got = g126_sample(&sim, "out", 8).expect("out must be driven");
+            let want = (((a >> 3) & 1).wrapping_mul(b & 0xff)) & 0xff;
+            assert_eq!(got, want, "bit mul: {a}[3] * {b} = {want}, sim gave {got}");
+        }
+    }
+
+    #[test]
+    fn cov_enable_wrapped_mac_8x8_maps_to_luts() {
+        // Same source as g126_mux_wrapped_mac_8x8_stays_dsp, which pins the
+        // old behaviour (16 DSPs, mux conditions dropped). The splice
+        // lowers the one shared small multiply to LUTs and keeps the
+        // clear/enable muxes, so the form is now correct as well as DSP-free.
+        let src = r#"
+module mac #(parameter DW = 8, parameter OW = 16) (
+  input clk, input clear, input en,
+  input [DW-1:0] a, input [DW-1:0] b,
+  output reg [OW-1:0] c
+);
+  always @(posedge clk) begin
+    if (clear) c <= 0;
+    else if (en) c <= c + a * b;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "mac.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "enable-wrapped 8x8 MAC must not use a DSP, got {dsps}");
+        assert_eq!(hffs, 16, "enable-wrapped MAC registers all 16 bits, got {hffs}");
+        // One shared 8x8 product (64 LUTs, 14 Carry4) plus the per-bit
+        // bit-blast of the 16-bit add (172 LUTs, no Carry4: the if/else
+        // flattens to per-bit NBAs, so the add never reaches the Carry4
+        // ripple helper) and the clear/enable muxes (53 LUTs). 291 is
+        // heavy against Vivado's ~80; the whole-vector reconstruction
+        // that would route the add through Carry4 is G128 scope, not a
+        // decision-coverage gap: the decision itself is right (one
+        // shared product, 0 DSPs) and the sim test proves the values.
+        assert_eq!(luts, 291, "enable-wrapped 8x8 MAC is 291 LUTs, got {luts}");
+        assert_eq!(carry4s, 14, "enable-wrapped 8x8 MAC is 14 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_enable_wrapped_mac_sim_values() {
+        let src = r#"
+module mac #(parameter DW = 8, parameter OW = 16) (
+  input clk, input clear, input en,
+  input [DW-1:0] a, input [DW-1:0] b,
+  output reg [OW-1:0] c
+);
+  always @(posedge clk) begin
+    if (clear) c <= 0;
+    else if (en) c <= c + a * b;
+  end
+endmodule
+"#;
+        let mut d = synth_sv(src, "mac.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        let step = |sim: &mut helion_sim::Sim, clear: u64, en: u64, a: u64, b: u64, want: u64| {
+            g126_drive(sim, "clear", 1, clear);
+            g126_drive(sim, "en", 1, en);
+            g126_drive(sim, "a", 8, a);
+            g126_drive(sim, "b", 8, b);
+            sim.step_posedge(10);
+            let got = g126_sample(sim, "c", 16).expect("c must be driven");
+            assert_eq!(got, want, "clear={clear} en={en} a={a} b={b}: c = {want}, sim gave {got}");
+        };
+        step(&mut sim, 1, 0, 0, 0, 0);
+        step(&mut sim, 0, 1, 3, 4, 12);
+        step(&mut sim, 0, 0, 9, 9, 12);
+        step(&mut sim, 0, 1, 2, 10, 32);
+        step(&mut sim, 1, 1, 255, 255, 0);
+        step(&mut sim, 0, 1, 255, 255, 65025);
+        step(&mut sim, 0, 0, 1, 1, 65025);
+    }
+
+    #[test]
+    fn cov_comb_mac_8x8_maps_to_luts() {
+        // Combinational MAC: reaches the DSP pass only because the
+        // flatten-cap exemption covers whole-RHS multiply forms.
+        let src = r#"
+module mac(input [7:0] a, input [7:0] b, input [15:0] c, output [15:0] out);
+  assign out = a * b + c;
+endmodule
+"#;
+        let d = synth_sv(src, "mac.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "combinational 8x8 MAC must not use a DSP");
+        assert_eq!(hffs, 0, "combinational MAC has no flops");
+        assert_eq!(luts, 80, "combinational 8x8 MAC is 80 LUTs, got {luts}");
+        assert_eq!(carry4s, 18, "combinational 8x8 MAC is 18 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_comb_mac_sim_values() {
+        let src = r#"
+module mac(input [7:0] a, input [7:0] b, input [15:0] c, output [15:0] out);
+  assign out = a * b + c;
+endmodule
+"#;
+        let mut d = synth_sv(src, "mac.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        for (a, b, c) in g126_vectors() {
+            g126_drive(&mut sim, "a", 8, a);
+            g126_drive(&mut sim, "b", 8, b);
+            g126_drive(&mut sim, "c", 16, c);
+            let got = g126_sample(&sim, "out", 16).expect("out must be driven");
+            let want = (a.wrapping_mul(b).wrapping_add(c)) & 0xffff;
+            assert_eq!(got, want, "comb MAC: {a} * {b} + {c} = {want}, sim gave {got}");
+        }
+    }
+
+    #[test]
+    fn cov_comb_sub_8x8_maps_to_luts() {
+        // a*b-c lowers as a Carry4 array multiplier plus a Carry4 subtract
+        // (S = XNOR, CYINIT = 1). Same cell budget as the MAC.
+        let src = r#"
+module sub(input [7:0] a, input [7:0] b, input [15:0] c, output [15:0] out);
+  assign out = a * b - c;
+endmodule
+"#;
+        let d = synth_sv(src, "sub.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "combinational 8x8 sub must not use a DSP");
+        assert_eq!(hffs, 0, "combinational sub has no flops");
+        assert_eq!(luts, 80, "combinational 8x8 sub is 80 LUTs, got {luts}");
+        assert_eq!(carry4s, 18, "combinational 8x8 sub is 18 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_comb_sub_sim_values() {
+        let src = r#"
+module sub(input [7:0] a, input [7:0] b, input [15:0] c, output [15:0] out);
+  assign out = a * b - c;
+endmodule
+"#;
+        let mut d = synth_sv(src, "sub.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        for (a, b, c) in g126_vectors() {
+            g126_drive(&mut sim, "a", 8, a);
+            g126_drive(&mut sim, "b", 8, b);
+            g126_drive(&mut sim, "c", 16, c);
+            let got = g126_sample(&sim, "out", 16).expect("out must be driven");
+            let want = (a.wrapping_mul(b).wrapping_sub(c)) & 0xffff;
+            assert_eq!(got, want, "comb sub: {a} * {b} - {c} = {want}, sim gave {got}");
+        }
+    }
+
+    #[test]
+    fn cov_reg_sub_8x8_maps_to_luts() {
+        let src = r#"
+module sub(input logic clk, input logic [7:0] a, input logic [7:0] b, input logic [15:0] c, output logic [15:0] p);
+  always_ff @(posedge clk) p <= a * b - c;
+endmodule
+"#;
+        let d = synth_sv(src, "sub.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "registered 8x8 sub must not use a DSP");
+        assert_eq!(luts, 80, "registered 8x8 sub is 80 LUTs, got {luts}");
+        assert_eq!(carry4s, 18, "registered 8x8 sub is 18 Carry4, got {carry4s}");
+        assert_eq!(hffs, 16, "registered 8x8 sub registers all 16 bits, got {hffs}");
+    }
+
+    #[test]
+    fn cov_reg_sub_sim_values() {
+        let src = r#"
+module sub(input logic clk, input logic [7:0] a, input logic [7:0] b, input logic [15:0] c, output logic [15:0] p);
+  always_ff @(posedge clk) p <= a * b - c;
+endmodule
+"#;
+        let mut d = synth_sv(src, "sub.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        for (a, b, c) in g126_vectors() {
+            g126_drive(&mut sim, "a", 8, a);
+            g126_drive(&mut sim, "b", 8, b);
+            g126_drive(&mut sim, "c", 16, c);
+            sim.step_posedge(10);
+            let got = g126_sample(&sim, "p", 16).expect("p must be driven");
+            let want = (a.wrapping_mul(b).wrapping_sub(c)) & 0xffff;
+            assert_eq!(got, want, "reg sub: {a} * {b} - {c} = {want}, sim gave {got}");
+        }
+    }
+
+    #[test]
+    fn cov_comb_sumprod_8x8_maps_to_luts() {
+        let src = r#"
+module sop(input [7:0] a, input [7:0] b, input [7:0] c, input [7:0] d, output [15:0] out);
+  assign out = a * b + c * d;
+endmodule
+"#;
+        let d = synth_sv(src, "sop.sv").expect("synth");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "combinational 8x8 sum of products must not use a DSP");
+        assert_eq!(hffs, 0, "combinational sum of products has no flops");
+        assert_eq!(luts, 144, "combinational 8x8 sum of products is 144 LUTs, got {luts}");
+        assert_eq!(carry4s, 32, "combinational 8x8 sum of products is 32 Carry4, got {carry4s}");
+    }
+
+    #[test]
+    fn cov_comb_sumprod_sim_values() {
+        let src = r#"
+module sop(input [7:0] a, input [7:0] b, input [7:0] c, input [7:0] d, output [15:0] out);
+  assign out = a * b + c * d;
+endmodule
+"#;
+        let mut d = synth_sv(src, "sop.sv").expect("synth");
+        g126_bit_blast_ports(&mut d);
+        let mut sim = helion_sim::Sim::new(&d);
+        for (a, b, c16) in g126_vectors() {
+            let c = c16 & 0xff;
+            let e = (c16 >> 8) & 0xff;
+            g126_drive(&mut sim, "a", 8, a);
+            g126_drive(&mut sim, "b", 8, b);
+            g126_drive(&mut sim, "c", 8, c);
+            g126_drive(&mut sim, "d", 8, e);
+            let got = g126_sample(&sim, "out", 16).expect("out must be driven");
+            let want = (a.wrapping_mul(b).wrapping_add(c.wrapping_mul(e))) & 0xffff;
+            assert_eq!(got, want, "comb sumprod: {a}*{b} + {c}*{e} = {want}, sim gave {got}");
+        }
+    }
+
+    #[test]
+    fn cov_large_sub_16x16_stays_dsp() {
+        // Residual, pre-existing: a wide a*b-c still goes to emit_mac27,
+        // which wires P = A*B and drops the subtraction (accum_c only
+        // matches Add). This test pins the routing only; it deliberately
+        // does NOT assert values. Fixing the wide sub is G128 scope.
+        let src = r#"
+module sub(input [15:0] a, input [15:0] b, input [31:0] c, output [31:0] out);
+  assign out = a * b - c;
+endmodule
+"#;
+        let d = synth_sv(src, "sub.sv").expect("synth");
+        let (luts, _, _, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 1, "16x16 sub stays on DSP, got {dsps}");
+        assert_eq!(luts, 0, "DSP path must not bitblast a 16x16 sub, got {luts}");
+    }
+
+    #[test]
+    fn cov_cap_path_small_mac_maps_to_luts() {
+        // The module is capped by the leftover `r` cone (a sum of two
+        // products plus an addend, which no whole-RHS form matches), but
+        // the small combinational MAC `p` must still lower to LUTs in the
+        // cap path instead of being dropped with the module.
+        let src = r#"
+module m(input [7:0] a, input [7:0] b, input [15:0] c,
+  input [15:0] x, input [15:0] y, input [15:0] z, input [15:0] w, input [31:0] v,
+  output [15:0] p, output [31:0] r);
+  assign p = a * b + c;
+  assign r = (x * y) + (z * w) + v;
+endmodule
+"#;
+        let d = synth_sv(src, "m.sv").expect("synth");
+        assert_eq!(d.attrs.get("FLATTEN_CAP"), Some("1"), "the leftover cone must still cap the module");
+        let (luts, carry4s, hffs, dsps) = g126_counts(&d);
+        assert_eq!(dsps, 0, "capped small MAC must not use a DSP");
+        assert_eq!(hffs, 0, "capped small MAC has no flops");
+        assert_eq!(luts, 80, "capped small MAC is 80 LUTs, got {luts}");
+        assert_eq!(carry4s, 18, "capped small MAC is 18 Carry4, got {carry4s}");
     }
 
     // G126 value guard: simulate the synthesized netlist with helion-sim
@@ -26283,17 +26880,23 @@ endmodule
         let mut out = Vec::new();
         for p in &d.ports {
             let name = resolve(p.name).to_string();
-            if nets.contains(&name) || !nets.contains(&format!("{name}_0")) {
-                out.push(p.clone());
+            // Expand a port into per-bit ports for every bit net that
+            // exists, not just a contiguous run from bit 0: a sliced
+            // operand (a[15:8]) leaves the low bits unconnected, and the
+            // sim must still be able to drive the bits that exist.
+            let mut any_bit = false;
+            for i in 0..64 {
+                if nets.contains(&format!("{name}_{i}")) {
+                    any_bit = true;
+                    out.push(Port {
+                        name: intern(&format!("{name}_{i}")),
+                        dir: p.dir,
+                        attrs: p.attrs.clone(),
+                    });
+                }
             }
-            let mut i = 0;
-            while nets.contains(&format!("{name}_{i}")) {
-                out.push(Port {
-                    name: intern(&format!("{name}_{i}")),
-                    dir: p.dir,
-                    attrs: p.attrs.clone(),
-                });
-                i += 1;
+            if !any_bit {
+                out.push(p.clone());
             }
         }
         d.ports = out;
